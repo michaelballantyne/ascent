@@ -1,0 +1,29 @@
+;; Feature demo for the Slog m-CFA port.  Exercises let (multi-binding),
+;; multi-argument lambda, application, if, a binary primitive, variable
+;; reference, and number/boolean literals.
+;;
+;;   (let ([add (lambda (a b) (+ a b))]
+;;         [t   #t])
+;;     (if t
+;;         (add (+ 1 2) 10)
+;;         0))
+;;
+;; Every node carries a unique integer label (its first field) so that
+;; structurally identical occurrences stay distinct (the crate's
+;; `to_expr_labeled` identity).  The result is the abstract primitive
+;; value (v_prim "+" ...); inspect out/arith/result.csv.
+;;
+;; Run (from the slog repo root):
+;;   racket slog.rkt --debug-dir out/arith \
+;;     ../ascent/scheme-mcfa/slog/example-arith.slog
+
+include "mcfa.slog"
+
+facts
+(top
+ (let_e 1
+   [ (bnd "add" (lam 2 ["a" "b"] (prim 3 "+" (ref 4 "a") (ref 5 "b"))))
+     (bnd "t"   (cbool 6 "#t")) ]
+   (if_e 7 (ref 8 "t")
+           (app 9 (ref 10 "add") [ (prim 11 "+" (cnum 12 1) (cnum 13 2)) (cnum 14 10) ])
+           (cnum 15 0))))

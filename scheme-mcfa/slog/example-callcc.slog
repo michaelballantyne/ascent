@@ -1,0 +1,21 @@
+;; call/cc demo for the Slog m-CFA port.
+;;
+;;   (call/cc (lambda (k) (+ 1 2)))
+;;
+;; call/cc reifies the current continuation and passes it to the closure as
+;; the parameter k.  Here the closure ignores k and simply returns (+ 1 2),
+;; which flows out through call/cc's own continuation to the top -- so the
+;; result is the abstract primitive value (v_prim "+" ...).
+;;
+;; (Note: as in Appendix A / the crate, *invoking* the reified continuation
+;; with a non-closure value has no forwarding rule; this demo exercises the
+;; normal-return path.  See slog/README.md.)
+;;
+;; Run (from the slog repo root):
+;;   racket slog.rkt --debug-dir out/callcc \
+;;     ../ascent/scheme-mcfa/slog/example-callcc.slog
+
+include "mcfa.slog"
+
+facts
+(top (callcc 1 (lam 2 ["k"] (prim 3 "+" (cnum 4 1) (cnum 5 2)))))

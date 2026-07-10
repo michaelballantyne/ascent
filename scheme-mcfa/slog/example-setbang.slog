@@ -1,0 +1,17 @@
+;; set! demo for the Slog m-CFA port.
+;;
+;;   ((lambda (x) (set! x 5)) 0)
+;;
+;; The parameter x is bound to 0 at the call, then mutated to 5; both values
+;; end up at x's abstract address (a flow-insensitive store -- inspect
+;; out/setbang/stored_val.csv).  set! itself yields the dummy (v_num -42)
+;; the machine uses for set!'s result, which reaches the halt continuation.
+;;
+;; Run (from the slog repo root):
+;;   racket slog.rkt --debug-dir out/setbang \
+;;     ../ascent/scheme-mcfa/slog/example-setbang.slog
+
+include "mcfa.slog"
+
+facts
+(top (app 1 (lam 2 ["x"] (set_e 3 "x" (cnum 4 5))) [ (cnum 5 0) ]))
