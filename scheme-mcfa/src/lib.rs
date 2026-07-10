@@ -28,21 +28,23 @@
 // snake-case lint noise for `if_`/`let_`.
 #![allow(non_snake_case)]
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use ascent::ascent;
 
+pub mod aam;
 pub mod ast;
 pub mod edb;
 pub mod generic;
 pub mod parallel;
 pub mod structured;
 
+pub use aam::{AamStats, analyze_aam};
 pub use ast::{Ast, Sym, church_term, feature_term, worst_case_term, worst_case_term_single};
 pub use edb::Facts;
 pub use generic::{GenericStats, analyze_generic};
 pub use parallel::analyze_generic_par;
-pub use structured::{StructuredStats, analyze_structured, to_expr};
+pub use structured::{StructuredStats, analyze_structured, analyze_structured_run, to_expr, to_expr_labeled};
 
 /// `context = Context{ctx0:id}` — a length-1 contour of expression ids.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -86,21 +88,23 @@ pub enum Kont {
    Prim2 { op: Sym, v1: Value, next_ak: AddrK },
 }
 
+static MT: LazyLock<Sym> = LazyLock::new(|| Arc::from(""));
+static TT: LazyLock<Sym> = LazyLock::new(|| Arc::from("#t"));
+static FF: LazyLock<Sym> = LazyLock::new(|| Arc::from("#f"));
+
 /// The empty context `$Context("")`.
-fn mt() -> Sym { Arc::from("") }
+fn mt() -> Sym { MT.clone() }
 /// The `#t` symbol.
-fn tt() -> Sym { Arc::from("#t") }
+pub(crate) fn tt() -> Sym { TT.clone() }
 /// The `#f` symbol.
-fn ff() -> Sym { Arc::from("#f") }
+pub(crate) fn ff() -> Sym { FF.clone() }
 
 /// The set of values the appendix treats as "true" in the A-IfT rule: any
 /// value except `#f` (and except `PrimVal`, which — faithfully to the paper —
 /// the appendix's A-If rules do not handle).
 fn if_true(v: &Value) -> bool {
-   matches!(
-      v,
-      Value::Closure { .. } | Value::Number(_) | Value::Kont(_)
-   ) || matches!(v, Value::Bool(b) if b.as_ref() == "#t")
+   matches!(v, Value::Closure { .. } | Value::Number(_) | Value::Kont(_))
+      || matches!(v, Value::Bool(b) if b.as_ref() == "#t")
 }
 
 ascent! {

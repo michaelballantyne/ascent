@@ -23,7 +23,7 @@ fn main() {
          let k = arg(&args, 3, 3);
          let p = arg(&args, 4, 0);
          run_once(n, k, p, true);
-      }
+      },
       "bench" => bench(),
       "church" => {
          let nn = arg(&args, 2, 8);
@@ -33,18 +33,27 @@ fn main() {
          let start = Instant::now();
          prog.run();
          let elapsed = start.elapsed();
-         let derived = prog.state_e.len() + prog.state_a.len() + prog.stored_val.len()
-            + prog.stored_kont.len() + prog.flow_ee.len() + prog.flow_ea.len()
-            + prog.flow_ae.len() + prog.flow_aa.len();
-         println!("church(sum 0..={nn}) input={n_input} state_a={} stored_val={} derived={derived} time={:.3?}",
-            prog.state_a.len(), prog.stored_val.len(), elapsed);
-      }
+         let derived = prog.state_e.len()
+            + prog.state_a.len()
+            + prog.stored_val.len()
+            + prog.stored_kont.len()
+            + prog.flow_ee.len()
+            + prog.flow_ea.len()
+            + prog.flow_ae.len()
+            + prog.flow_aa.len();
+         println!(
+            "church(sum 0..={nn}) input={n_input} state_a={} stored_val={} derived={derived} time={:.3?}",
+            prog.state_a.len(),
+            prog.stored_val.len(),
+            elapsed
+         );
+      },
       "cfa" => {
          let n = arg(&args, 2, 8);
          let k = arg(&args, 3, 2);
          let p = arg(&args, 4, 0);
          cfa_sweep(n, k, p);
-      }
+      },
       "church-cfa" => {
          let nn = arg(&args, 2, 2);
          let minm = arg(&args, 3, 0);
@@ -57,14 +66,26 @@ fn main() {
             let stats = scheme_mcfa::analyze_generic(&facts, m);
             println!("{:>3}  {:>12}  {:>12.3?}", m, stats.total_derived(), start.elapsed());
          }
-      }
+      },
       "structured" => {
          let n = arg(&args, 2, 8);
          let k = arg(&args, 3, 2);
          let p = arg(&args, 4, 0);
          let m = arg(&args, 5, 1);
          structured_vs_flat(n, k, p, m);
-      }
+      },
+      "aam" => {
+         let n = arg(&args, 2, 10);
+         let k = arg(&args, 3, 3);
+         let p = arg(&args, 4, 0);
+         let m = arg(&args, 5, 1);
+         aam_vs_datalog(&worst_case_term(n, k, p), &format!("worst-case N={n} K={k} P={p}"), m);
+      },
+      "aam-church" => {
+         let nn = arg(&args, 2, 40);
+         let m = arg(&args, 3, 1);
+         aam_vs_datalog(&scheme_mcfa::church_term(nn), &format!("church(sum 0..={nn})"), m);
+      },
       "church-par" => {
          // Parallel run on the Church benchmark; threads from RAYON_NUM_THREADS.
          let nn = arg(&args, 2, 60);
@@ -74,9 +95,12 @@ fn main() {
          let stats = scheme_mcfa::analyze_generic_par(&facts, m);
          let elapsed = start.elapsed();
          let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "default".into());
-         println!("ascent_par church(0..={nn}) m={m} threads={threads}  derived={}  time={:.3?}",
-            stats.total_derived(), elapsed);
-      }
+         println!(
+            "ascent_par church(0..={nn}) m={m} threads={threads}  derived={}  time={:.3?}",
+            stats.total_derived(),
+            elapsed
+         );
+      },
       "par" => {
          // Parallel run; thread count comes from RAYON_NUM_THREADS.
          let n = arg(&args, 2, 12);
@@ -88,9 +112,12 @@ fn main() {
          let stats = scheme_mcfa::analyze_generic_par(&facts, m);
          let elapsed = start.elapsed();
          let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "default".into());
-         println!("ascent_par N={n} K={k} P={p} m={m} threads={threads}  derived={}  time={:.3?}",
-            stats.total_derived(), elapsed);
-      }
+         println!(
+            "ascent_par N={n} K={k} P={p} m={m} threads={threads}  derived={}  time={:.3?}",
+            stats.total_derived(),
+            elapsed
+         );
+      },
       "emit-souffle" | "emit-souffle-single" | "emit-souffle-church" => {
          let dir = args.get(2).cloned().unwrap_or_else(|| {
             eprintln!("{cmd} needs a target DIR");
@@ -109,7 +136,7 @@ fn main() {
          let facts = Facts::from_ast(&ast);
          facts.write_souffle(Path::new(&dir)).expect("write souffle facts");
          println!("wrote {} input facts for term N={n} K={k} P={p} into {dir}", facts.len());
-      }
+      },
       "dump" => {
          let dir = args.get(2).cloned().unwrap_or_else(|| {
             eprintln!("dump needs a target DIR");
@@ -119,12 +146,12 @@ fn main() {
          let k = arg(&args, 4, 2);
          let p = arg(&args, 5, 1);
          dump(&dir, n, k, p);
-      }
+      },
       other => {
          eprintln!("unknown command: {other}");
          eprintln!("usage: mcfa [run N K P | bench | emit-souffle DIR N K P | dump DIR N K P]");
          std::process::exit(1);
-      }
+      },
    }
 }
 
@@ -157,13 +184,17 @@ fn run_once(n: usize, k: usize, p: usize, verbose: bool) {
       println!("  state_a:       {}", prog.state_a.len());
       println!("  stored_val:    {}", prog.stored_val.len());
       println!("  stored_kont:   {}", prog.stored_kont.len());
-      println!("  flow_ee/ea/ae/aa: {}/{}/{}/{}",
-         prog.flow_ee.len(), prog.flow_ea.len(), prog.flow_ae.len(), prog.flow_aa.len());
+      println!(
+         "  flow_ee/ea/ae/aa: {}/{}/{}/{}",
+         prog.flow_ee.len(),
+         prog.flow_ea.len(),
+         prog.flow_ae.len(),
+         prog.flow_aa.len()
+      );
       println!("  total derived: {derived}");
       println!("  time:          {:.3?}", elapsed);
    } else {
-      println!("N={n:<4} K={k:<3} P={p:<2} input={n_input:<6} derived={derived:<8} time={:>10.3?}",
-         elapsed);
+      println!("N={n:<4} K={k:<3} P={p:<2} input={n_input:<6} derived={derived:<8} time={:>10.3?}", elapsed);
    }
 }
 
@@ -184,10 +215,13 @@ fn cfa_sweep(n: usize, k: usize, p: usize) {
    }
 }
 
-/// Variation: compare the structured-syntax analysis against the flat
-/// (id-relation) analysis on the same source term, at the same `m`.
+/// Variation: compare the structured-syntax analysis (in both labelings)
+/// against the flat (id-relation) analysis on the same source term, at the
+/// same `m`. The occurrence-labelled run should match the flat one
+/// relation-for-relation; the hash-consed one identifies structurally equal
+/// subterms.
 fn structured_vs_flat(n: usize, k: usize, p: usize, m: usize) {
-   use scheme_mcfa::{Facts, analyze_generic, analyze_structured, to_expr, worst_case_term};
+   use scheme_mcfa::{Facts, analyze_generic, analyze_structured, to_expr, to_expr_labeled, worst_case_term};
    let ast = worst_case_term(n, k, p);
 
    let t0 = Instant::now();
@@ -195,28 +229,80 @@ fn structured_vs_flat(n: usize, k: usize, p: usize, m: usize) {
    let flat_t = t0.elapsed();
 
    let t1 = Instant::now();
-   let structured = analyze_structured(&to_expr(&ast), m);
-   let structured_t = t1.elapsed();
+   let labeled = analyze_structured(&to_expr_labeled(&ast), m);
+   let labeled_t = t1.elapsed();
+
+   let t2 = Instant::now();
+   let hashconsed = analyze_structured(&to_expr(&ast), m);
+   let hashconsed_t = t2.elapsed();
 
    println!("term N={n} K={k} P={p}, m={m}\n");
-   println!("{:<14} {:>14} {:>14}", "relation", "flat (ids)", "structured");
+   println!("{:<14} {:>14} {:>14} {:>14}", "relation", "flat (ids)", "labelled", "hash-consed");
    let rows = [
-      ("state_e", flat.state_e, structured.state_e),
-      ("state_a", flat.state_a, structured.state_a),
-      ("stored_val", flat.stored_val, structured.stored_val),
-      ("stored_kont", flat.stored_kont, structured.stored_kont),
-      ("flow_ee", flat.flow_ee, structured.flow_ee),
-      ("flow_ea", flat.flow_ea, structured.flow_ea),
-      ("flow_ae", flat.flow_ae, structured.flow_ae),
-      ("flow_aa", flat.flow_aa, structured.flow_aa),
-      ("peek_ctx", flat.peek_ctx, structured.peek_ctx),
-      ("copy_ctx", flat.copy_ctx, structured.copy_ctx),
+      ("state_e", flat.state_e, labeled.state_e, hashconsed.state_e),
+      ("state_a", flat.state_a, labeled.state_a, hashconsed.state_a),
+      ("stored_val", flat.stored_val, labeled.stored_val, hashconsed.stored_val),
+      ("stored_kont", flat.stored_kont, labeled.stored_kont, hashconsed.stored_kont),
+      ("flow_ee", flat.flow_ee, labeled.flow_ee, hashconsed.flow_ee),
+      ("flow_ea", flat.flow_ea, labeled.flow_ea, hashconsed.flow_ea),
+      ("flow_ae", flat.flow_ae, labeled.flow_ae, hashconsed.flow_ae),
+      ("flow_aa", flat.flow_aa, labeled.flow_aa, hashconsed.flow_aa),
+      ("peek_ctx", flat.peek_ctx, labeled.peek_ctx, hashconsed.peek_ctx),
+      ("copy_ctx", flat.copy_ctx, labeled.copy_ctx, hashconsed.copy_ctx),
    ];
-   for (name, a, b) in rows {
-      println!("{name:<14} {a:>14} {b:>14}");
+   for (name, a, b, c) in rows {
+      println!("{name:<14} {a:>14} {b:>14} {c:>14}");
    }
-   println!("{:<14} {:>14} {:>14}", "total derived", flat.total_derived(), structured.total_derived());
-   println!("{:<14} {:>14.3?} {:>14.3?}", "time", flat_t, structured_t);
+   println!(
+      "{:<14} {:>14} {:>14} {:>14}",
+      "total derived",
+      flat.total_derived(),
+      labeled.total_derived(),
+      hashconsed.total_derived()
+   );
+   println!("{:<14} {:>14.3?} {:>14.3?} {:>14.3?}", "time", flat_t, labeled_t, hashconsed_t);
+}
+
+/// Variation: the identical analysis without Datalog — the hand-written
+/// abstract machine (`aam`) vs. the structured Ascent program, on the same
+/// occurrence-labelled term. The relation sizes must agree (content equality is
+/// checked in `tests/aam_check.rs`); the times are the comparison.
+fn aam_vs_datalog(ast: &scheme_mcfa::Ast, name: &str, m: usize) {
+   use scheme_mcfa::{analyze_aam, analyze_structured, to_expr_labeled};
+   let top = to_expr_labeled(ast);
+
+   let t0 = Instant::now();
+   let dl = analyze_structured(&top, m);
+   let dl_t = t0.elapsed();
+
+   let t1 = Instant::now();
+   let am = analyze_aam(&top, m);
+   let am_t = t1.elapsed();
+
+   println!("{name}, m={m}\n");
+   println!("{:<14} {:>14} {:>14}", "relation", "ascent", "direct AAM");
+   let rows = [
+      ("state_e", dl.state_e, am.state_e),
+      ("state_a", dl.state_a, am.state_a),
+      ("stored_val", dl.stored_val, am.stored_val),
+      ("stored_kont", dl.stored_kont, am.stored_kont),
+      ("flow_ee", dl.flow_ee, am.flow_ee),
+      ("flow_ea", dl.flow_ea, am.flow_ea),
+      ("flow_ae", dl.flow_ae, am.flow_ae),
+      ("flow_aa", dl.flow_aa, am.flow_aa),
+   ];
+   for (rel, a, b) in rows {
+      let mark = if a == b { "" } else { "   <-- MISMATCH" };
+      println!("{rel:<14} {a:>14} {b:>14}{mark}");
+   }
+   println!("{:<14} {:>14} {:>14}", "total derived", dl.total_derived(), am.total_derived());
+   println!("{:<14} {:>14.3?} {:>14.3?}", "time", dl_t, am_t);
+   println!(
+      "\naam steps: {} over {} states (re-steps from store growth: {})",
+      am.steps,
+      am.state_e + am.state_a,
+      am.steps - (am.state_e + am.state_a)
+   );
 }
 
 fn fmt_ctx(c: &Ctx) -> String { format!("$Context({})", c.0) }
@@ -255,13 +341,7 @@ fn dump(dir: &str, n: usize, k: usize, p: usize) {
 fn bench() {
    println!("m-CFA (Ascent, faithful m=1) — worst-case term sweep");
    println!("(N = calls to f, K = nested + applications, P = identity padding)\n");
-   let configs = [
-      (6, 2, 0),
-      (8, 2, 0),
-      (10, 3, 0),
-      (12, 3, 0),
-      (8, 4, 0),
-   ];
+   let configs = [(6, 2, 0), (8, 2, 0), (10, 3, 0), (12, 3, 0), (8, 4, 0)];
    for (n, k, p) in configs {
       run_once(n, k, p, false);
    }
