@@ -38,11 +38,13 @@ This crate:
 | `src/generic.rs` | **Variation:** the same analysis generalized to a length-`m` contour, with `m` a runtime parameter (`analyze_generic`). |
 | `src/structured.rs` | **Variation:** syntax represented as a recursive `Expr` enum matched structurally in the rules, instead of flat id-relations (`analyze_structured`). |
 | `src/parallel.rs` | The generic analysis via `ascent_run_par!` (`analyze_generic_par`), for thread-scaling measurements. |
+| `src/aam.rs` | A **hand-written AAM worklist** reference implementation — no Datalog, just a global store and an event-driven worklist (`analyze_aam`). |
 | `src/main.rs` | CLI runner / benchmarks. |
 | `souffle/mcfa.dl` | The original Soufflé program, transcribed verbatim from Appendix A (only change: Soufflé 2.4.1 spells the nullary constructor `$MT()`). |
 | `souffle/mcfa_adt.dl` | **Experiment:** a Soufflé version that carries syntax as an `expr` ADT instead of flat relations, to test whether ADTs regress performance. |
 | `tests/cross_check.rs` | Runs Ascent and Soufflé on the same input and asserts the outputs agree. |
-| `tests/generic_check.rs` | Checks generic `m=1` ≡ the faithful port, and reproduces the polyvariance/padding phenomena. |
+| `tests/generic_check.rs` | Checks generic `m=1` ≡ the faithful port, reproduces the polyvariance/padding phenomena, and checks parallel ≡ sequential. |
+| `tests/aam_check.rs` | Checks the hand-written AAM computes bit-for-bit the same relations as the Datalog, at `m ∈ {0,1,2}`. |
 | `tests/structured_check.rs` | Checks the structured variant against the flat one (identical on duplicate-free terms; conflating on repeated subterms). |
 
 ## Running
@@ -218,6 +220,58 @@ church(sum 0..=N), faithful m=1 (Ascent)
   N=60  36904 derived   1.15 s
   N=80  64334 derived   3.36 s
 ```
+
+## A hand-written AAM (no Datalog) — and how it compares
+
+`src/aam.rs` implements the *same* `m`-CFA as a traditional Abstracting Abstract
+Machine directly in Rust: a global value store and continuation store
+(`VAddr → P(Value)`, `KAddr → P(Kont)`) and an event-driven, semi-naive
+**worklist**. It reuses the *exact same* value/kont/context types as the
+`generic` Datalog analysis and runs over the same input, so
+`tests/aam_check.rs` can assert it computes bit-for-bit the same relations
+(all sizes and `flow_ee` content, at `m ∈ {0,1,2}`).
+
+Comparing all engines at `m = 1` (single thread; Soufflé is the compiled
+`.printsize` binary; "ascent!" is the faithful item-macro port, "generic" is the
+`ascent_run!` version with a length-`m` vector context):
+
+| term | Soufflé | ascent! | ascent generic | **AAM (raw Rust)** |
+|------|---------|---------|----------------|--------------------|
+| worst-case `N=12 K=3 P=0` | 2.05 s | 1.70 s | 10.3 s | **2.42 s** |
+| church(60) | 8.95 s | 1.11 s | 1.93 s | **0.056 s** |
+| church(80) | 28.3 s | 3.28 s | 5.22 s | **0.058 s** |
+
+Two very different regimes:
+
+* On the **value-domain-dominated** worst-case term (the cost is the `PrimVal`
+  blow-up), all four engines are within ~5× of each other — the work is
+  irreducible set-manipulation of large nested values, and the Datalog engines'
+  indexed joins are as good as the hand-written loop (Ascent's item macro is
+  actually the fastest).
+* On the **closure-flow-dominated** Church benchmark the AAM is **1–3 orders of
+  magnitude faster** (≈57× vs faithful Ascent, ≈490× vs Soufflé on church(80)).
+
+It is *not* free-variable precomputation that makes the difference — `freevar`
+depends only on the syntax (EDB) relations, so it is a lower stratum / separate
+SCC that the Datalog engines also saturate exactly once, and instrumenting the
+AAM (`MCFA_TIMING=1`) shows its `Program`+`freevar` setup is ~4 ms of the
+~63 ms church(80) run; the other ~46 ms is the worklist fixpoint itself. The
+difference is the **fixpoint engine's per-fact overhead**. Ascent/Soufflé
+maintain each relation as indexed structures with semi-naive delta bookkeeping
+over one big mutually-recursive SCC; Church's deeply nested, curried structure
+gives long derivation chains, so that SCC takes many saturation rounds, each
+paying per-relation overhead. Measured per-derived-fact cost bears this out:
+Ascent spends ~2.9 µs/fact on the (wide, shallow) worst-case term but ~51 µs/fact
+on the (deep) church(80) term, while the worklist — which touches each fact once
+regardless of chain depth — stays around 0.7 µs/fact. On the shallow worst-case
+term there are few rounds, so the Datalog engines are competitive (and Ascent's
+item macro is actually fastest).
+
+The takeaway is roughly the paper's framing in reverse: Datalog buys a
+*declarative, parallelizable, and competitive* implementation almost for free,
+but for a fixed analysis a hand-tuned AAM worklist can still dominate on
+deep/recursive workloads where the generic relational saturation is overhead.
+(`src/aam.rs` prints the setup-vs-worklist split under `MCFA_TIMING=1`.)
 
 ## Performance: Ascent vs Soufflé, and thread scaling
 

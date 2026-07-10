@@ -32,12 +32,14 @@ use std::sync::Arc;
 
 use ascent::ascent;
 
+pub mod aam;
 pub mod ast;
 pub mod edb;
 pub mod generic;
 pub mod parallel;
 pub mod structured;
 
+pub use aam::{AamStats, analyze_aam};
 pub use ast::{Ast, Sym, church_term, feature_term, worst_case_term, worst_case_term_single};
 pub use edb::Facts;
 pub use generic::{GenericStats, analyze_generic};

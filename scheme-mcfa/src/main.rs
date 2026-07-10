@@ -25,6 +25,31 @@ fn main() {
          run_once(n, k, p, true);
       }
       "bench" => bench(),
+      "engines" => {
+         // Compare the in-process engines on one term at m=1.
+         let which = args.get(2).map(|s| s.as_str()).unwrap_or("worst");
+         let facts = if which == "church" {
+            Facts::from_ast(&scheme_mcfa::church_term(arg(&args, 3, 60)))
+         } else {
+            Facts::from_ast(&worst_case_term(arg(&args, 3, 12), arg(&args, 4, 3), arg(&args, 5, 0)))
+         };
+         println!("engine comparison ({which}), m=1, {} input facts\n", facts.len());
+         // Ascent (faithful, ascent!)
+         let mut p = facts.clone().into_program();
+         let t = Instant::now();
+         p.run();
+         let derived = p.state_e.len() + p.state_a.len() + p.stored_val.len() + p.stored_kont.len()
+            + p.flow_ee.len() + p.flow_ea.len() + p.flow_ae.len() + p.flow_aa.len();
+         println!("  {:<26} derived={derived:<8} time={:>10.3?}", "ascent (Datalog, ascent!)", t.elapsed());
+         // Ascent (generic, ascent_run!, Vec ctx)
+         let t = Instant::now();
+         let g = scheme_mcfa::analyze_generic(&facts, 1);
+         println!("  {:<26} derived={:<8} time={:>10.3?}", "ascent (Datalog, generic)", g.total_derived(), t.elapsed());
+         // AAM (raw Rust worklist)
+         let t = Instant::now();
+         let a = scheme_mcfa::analyze_aam(&facts, 1);
+         println!("  {:<26} derived={:<8} time={:>10.3?}", "AAM (raw Rust worklist)", a.total_derived(), t.elapsed());
+      }
       "church" => {
          let nn = arg(&args, 2, 8);
          let facts = Facts::from_ast(&scheme_mcfa::church_term(nn));
