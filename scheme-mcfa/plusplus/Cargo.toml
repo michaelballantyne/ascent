@@ -1,0 +1,18 @@
+[package]
+name = "scheme-mcfa-plusplus"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# This crate deliberately depends on the "plusplus" research fork of ascent
+# (workspace version 0.7.0, https://github.com/michaelballantyne/ascent, branch
+# `plusplus`), pinned to a specific rev, side by side with the workspace's own
+# newer ascent (0.8.0, used transitively via the `scheme-mcfa` path dependency
+# below). Cargo can host two semver-incompatible `ascent` packages in one
+# dependency graph, but the git dependency below must NOT go through
+# `[workspace.dependencies]` (that table only ever points at the in-tree
+# ascent 0.8.0), so the version/git coordinates are written out explicitly
+# here instead of using `{ workspace = true }`.
+[dependencies]
+ascent = { git = "https://github.com/michaelballantyne/ascent", rev = "4f80fa11a2640379b34d43fe2e673e7375c71c71", default-features = false }
+scheme-mcfa = { path = ".." }

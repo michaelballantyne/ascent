@@ -101,16 +101,16 @@ static TT: LazyLock<Sym> = LazyLock::new(|| Arc::from("#t"));
 static FF: LazyLock<Sym> = LazyLock::new(|| Arc::from("#f"));
 
 /// The empty context `$Context("")`.
-pub(crate) fn mt() -> Sym { MT.clone() }
+pub fn mt() -> Sym { MT.clone() }
 /// The `#t` symbol.
-pub(crate) fn tt() -> Sym { TT.clone() }
+pub fn tt() -> Sym { TT.clone() }
 /// The `#f` symbol.
-pub(crate) fn ff() -> Sym { FF.clone() }
+pub fn ff() -> Sym { FF.clone() }
 
 /// The set of values the appendix treats as "true" in the A-IfT rule: any
 /// value except `#f` (and except `PrimVal`, which — faithfully to the paper —
 /// the appendix's A-If rules do not handle).
-pub(crate) fn if_true(v: &Value) -> bool {
+pub fn if_true(v: &Value) -> bool {
    matches!(v, Value::Closure { .. } | Value::Number(_) | Value::Kont(_))
       || matches!(v, Value::Bool(b) if b.as_ref() == "#t")
 }
