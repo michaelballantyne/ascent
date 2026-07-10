@@ -22,15 +22,17 @@ This crate:
 2. **Generates the paper's worst-case term family** (Section 5, Figs. 11–12)
    and provides a **basic benchmark**.
 3. **Cross-validates against the original Soufflé program** on identical input.
-4. Adds three **variations**: tunable polyvariance `m` (0/1/2-CFA), reproducing
-   the paper's headline observation that too little context makes the analysis
-   explode; a version representing syntax as structured data (a recursive
-   enum matched in the rules) rather than flat id-relations, in two labelings —
-   hash-consed (structural identity) and per-occurrence (Ascent expresses this
-   directly; in Soufflé the obstacle turns out to be ADT *ergonomics*, not join
-   cost — see the ADT experiment below); and a version with **no Datalog at
-   all** — the same machine hand-written in direct AAM style, checked
-   content-identical, benchmarked against the Ascent program.
+4. Adds several **variations**: tunable polyvariance `m` (0/1/2-CFA),
+   reproducing the paper's headline observation that too little context makes
+   the analysis explode; a version representing syntax as structured data (a
+   recursive enum matched in the rules) rather than flat id-relations, in two
+   labelings — hash-consed (structural identity) and per-occurrence (Ascent
+   expresses this directly; in Soufflé the obstacle turns out to be ADT
+   *ergonomics*, not join cost — see the ADT experiment below); **two
+   hand-written machines with no Datalog at all** (a textbook step machine and
+   an event-driven delta worklist), checked content-identical to the Datalog
+   fixpoint; and **delta-friendly "tuned" rule sets** for both the flat and
+   structured ports, closing most of the gap the machines expose.
 
 ## Layout
 
@@ -41,15 +43,19 @@ This crate:
 | `src/edb.rs` | Lowering of the AST to input facts (`Facts`), and a Soufflé `.facts` writer. |
 | `src/generic.rs` | **Variation:** the same analysis generalized to a length-`m` contour, with `m` a runtime parameter (`analyze_generic`). |
 | `src/structured.rs` | **Variation:** syntax represented as a recursive `Expr` enum matched structurally in the rules, instead of flat id-relations (`analyze_structured`). Nodes are labelled: `to_expr` hash-conses (structural identity), `to_expr_labeled` keeps every occurrence distinct (id semantics). |
-| `src/aam.rs` | **Variation:** the identical analysis with no Datalog — a hand-written abstract machine (state → state `step`, dependency-tracked worklist) over the same labelled syntax and abstract domains (`analyze_aam`). |
+| `src/tuned.rs` | The faithful port with **delta-friendly rules** (guards after joins, 3-atom joins split via materialized reader-index relations) — ~15–20× faster on deep terms. |
+| `src/structured_tuned.rs` | The same delta-friendly treatment applied to the **structured** port (`analyze_structured_tuned`); structured syntax needs fewer intermediates. |
+| `src/aam.rs` | **No Datalog #1:** a textbook abstract machine — state → state `step`, dedup'd FIFO work-set, dependency-tracked re-firing — over the labelled syntax (`analyze_aam`). |
+| `src/aam_delta.rs` | **No Datalog #2:** an event-driven worklist — each derived fact processed exactly once against reverse dependency indices; semi-naive evaluation by hand (`analyze_aam_delta`). |
 | `src/parallel.rs` | The generic analysis via `ascent_run_par!` (`analyze_generic_par`), for thread-scaling measurements. |
 | `src/main.rs` | CLI runner / benchmarks. |
 | `souffle/mcfa.dl` | The original Soufflé program, transcribed verbatim from Appendix A (only change: Soufflé 2.4.1 spells the nullary constructor `$MT()`). |
 | `souffle/mcfa_adt.dl` | **Experiment:** a Soufflé version that carries syntax as an `expr` ADT instead of flat relations, to test whether ADTs regress performance. |
 | `tests/cross_check.rs` | Runs Ascent and Soufflé on the same input and asserts the outputs agree. |
-| `tests/generic_check.rs` | Checks generic `m=1` ≡ the faithful port, and reproduces the polyvariance/padding phenomena. |
+| `tests/generic_check.rs` | Checks generic `m=1` ≡ the faithful port, reproduces the polyvariance/padding phenomena, and checks parallel ≡ sequential. |
 | `tests/structured_check.rs` | Checks the structured variant against the flat one: the occurrence-labelled tree matches on every term; hash-consing conflates repeated subterms — merging states on some terms, losing precision on others. |
-| `tests/aam_check.rs` | Checks the direct abstract machine derives **content-identical** relations (states, stores, flow graph) to the Ascent program, on both labelings, at `m = 0/1/2`. |
+| `tests/aam_check.rs` | Checks both hand-written machines derive **content-identical** relations (states, stores, flow graph) to the Ascent program, on both labelings, at `m = 0/1/2`. |
+| `tests/tuned_check.rs` | Checks the tuned programs compute the identical analysis to their untuned counterparts (flat: sizes + `stored_val`/`flow_ee` content; structured: all relation sizes, both labelings, `m = 0/1/2`). |
 
 ## Running
 
@@ -67,9 +73,14 @@ cargo run --release -p scheme-mcfa -- cfa 8 3 0
 # The structured-syntax variation vs. the flat one (same term, given m):
 cargo run --release -p scheme-mcfa -- structured 8 2 0 1
 
-# The direct (no-Datalog) abstract machine vs. the Ascent program:
+# The direct (no-Datalog) step machine vs. the Ascent program, relation by relation:
 cargo run --release -p scheme-mcfa -- aam 10 3 0 1
 cargo run --release -p scheme-mcfa -- aam-church 60 1
+
+# All seven engines on one term (worst N K P | church N), at m=1:
+cargo run --release -p scheme-mcfa -- engines worst 12 3 0
+cargo run --release -p scheme-mcfa -- engines church 80
+MCFA_SUMMARY=1 cargo run --release -p scheme-mcfa -- engines church 80  # + per-SCC summaries
 
 # The "realistic" Church-arithmetic benchmark (sum of Church numerals 0..=N):
 cargo run --release -p scheme-mcfa -- church 60
@@ -247,6 +258,138 @@ church(sum 0..=N), faithful m=1 (Ascent)
   N=80  64334 derived   3.36 s
 ```
 
+## Is Datalog actually a win? Two hand-written machines
+
+The Datalog program *is* an abstract machine in disguise: `state_e`/`state_a`
+are its configurations, `stored_val`/`stored_kont` its (globally widened)
+stores, and each rule one case of the transition relation. The crate implements
+that machine directly — with no Datalog — twice, at two points on the
+naive-to-optimized spectrum. Both run over the labelled syntax and abstract
+domains of the structured variant, and `tests/aam_check.rs` checks both derive
+**content-identical** relations to the Ascent fixpoint (states, both stores,
+and all four `flow_*` relations), on both labelings, at `m = 0/1/2`.
+
+* **The step machine** (`src/aam.rs`) is textbook AAM: a `State` is
+  ⟨e, ctx, aκ⟩ or ⟨v, aκ⟩; `step` maps a state to its successors, one `match`
+  arm per operational-semantics rule; a worklist runs it to the least fixpoint.
+  Two things are not textbook small-step, both forced by the global store:
+  *dependency re-firing* (a step that read an address is stale when it grows —
+  the engine records readers per address and re-enqueues them; this also
+  quietly replaces the Datalog `copy_ctx` standing subscription) and the
+  *work-set discipline* (a FIFO, deduplicated queue: a state woken many times
+  before it runs steps once, over the batch).
+* **The delta worklist** (`src/aam_delta.rs`) is semi-naive evaluation by hand:
+  the worklist carries *facts* (a new state, store binding, continuation, copy
+  edge), each processed exactly once against the already-known facts on the
+  other side of its join, through reverse dependency indices (value address →
+  waiting variable reads, continuation address → applied values, context →
+  outgoing copy edges). Nothing is ever re-scanned.
+
+Comparing all seven engines at `m = 1`, single thread (`mcfa engines`; "flat"
+ports use the appendix's single-id context, the structured ports and machines a
+length-`m` vector context; the tuned ports are described below):
+
+| engine | worst-case `N=12 K=3` | church(60) | church(80) |
+|--------|----------------------:|-----------:|-----------:|
+| ascent (flat, faithful `ascent!`) | 1.01 s | 0.34 s | 0.99 s |
+| ascent (flat, tuned) | **0.98 s** | 0.040 s | 0.066 s |
+| ascent (flat, generic `ascent_run!`) | 1.97 s | 1.08 s | 3.16 s |
+| ascent (structured, labelled) | 1.82 s | 0.75 s | 2.15 s |
+| ascent (structured, tuned) | 1.69 s | 0.054 s | 0.094 s |
+| AAM (step machine) | 2.09 s | 0.101 s | 0.203 s |
+| AAM (delta worklist) | 1.57 s | **0.019 s** | **0.033 s** |
+
+Two very different regimes:
+
+* The **worst-case family is one giant join** — nearly all of its ~585 k facts
+  come from the product of `Prim2` continuations × arriving values, over large
+  nested `PrimVal` values. Everything lands within ~2×, and the *tuned flat
+  Datalog is fastest*: indexed semi-naive joins over interned-id tuples beat
+  both hand-written machines at their own game.
+* **Church arithmetic is flow propagation** — many rules, small fan-outs, long
+  chains. The naive Datalog ports are 1–2 orders of magnitude slower than the
+  machines; the delta worklist is fastest overall; and the tuned Datalog closes
+  to within ~2–3× of it.
+
+### Why naive Datalog loses on deep terms: frontier-blindness
+
+It is *not* free-variable precomputation — `freevar` is a lower stratum that
+the Datalog engines also saturate once (166 iterations, ~8 ms on church(80);
+the machines' setup is likewise a few ms).
+
+The diagnosis comes from `MCFA_SUMMARY=1`, which prints Ascent's
+`scc_times_summary()` (per-SCC iteration counts, and per-rule times when
+`#![measure_rule_times]` is enabled):
+
+* On church(80) the analysis SCC runs **21,273 iterations** deriving 64,334
+  facts — **~3 new facts per iteration**. The deep curried structure makes the
+  dataflow frontier tiny; the fixpoint crawls, one abstract machine step per
+  round. (Worst-case `N=12`: 35 iterations, ~16,700 facts each — wide frontier,
+  join work dominates, everything is fine.)
+* Per-rule times concentrate almost all of the run in **four rule variants**,
+  all with the same shape: the semi-naive variant whose delta is on a *later*
+  body atom scans a big `total` index every round:
+  - `state_a(v, ak), if if_true(v), stored_kont(ak, ?If{..})` — the guard
+    *between* the atoms defeats Ascent's runtime-reorderable simple join, so the
+    delta=`stored_kont` variant iterates **all of `state_a`** (`indices_none`)
+    each round. Same for the `?Closure` pattern in A-C/cc's first atom.
+  - `state_e ⋈ call ⋈ peek_ctx` and `state_e ⋈ var ⋈ stored_val` — 3-atom
+    rules: the variant with the delta on the third atom re-enumerates the whole
+    2-atom prefix join each round.
+
+  21,273 rounds × O(all states) ≈ quadratic. The delta worklist never rescans:
+  its reverse dependency indices mean each new fact touches exactly its
+  readers.
+
+The step machine sits in between, and its history makes the same point from
+the other side: its first version used a plain LIFO stack with eager wakes (no
+dedup), and computed the same fixpoint on the `N=10 K=3` worst-case term in
+**83 s** instead of 0.8 s — every hot reader re-scanned its full fan-in once
+per arriving tuple. The two lines of worklist folklore (work-*set* dedup, FIFO
+batching) are load-bearing; forget them and even naive Datalog wins by 100×.
+With them, the step machine's residual cost vs. the delta worklist is batch
+re-scanning on re-fires — visible as the ~6× gap on church(80).
+
+### The fix is expressible in the rules (`src/tuned.rs`, `src/structured_tuned.rs`)
+
+`McfaTuned` is the faithful flat port with three mechanical rewrites:
+
+1. **guards/patterns moved after the joins** (`state_a(v, ak),
+   stored_kont(ak, ?If{..}), if if_true(v)`) — the two-atom join is then a
+   simple join that Ascent evaluates from whichever side is smaller (the delta);
+2. **3-atom joins split into binary joins** via intermediate relations
+   (`app_state`, `let_state`, `callcc_state`, `var_read`, `copy_edge`) — these
+   intermediates *are* the delta worklist's reader indices, materialized as
+   relations;
+3. **`stored_val`'s address flattened** to columns (`x, ctx, v`) so the store
+   joins by key from either side.
+
+`analyze_structured_tuned` applies the same treatment to the structured
+(labelled-syntax) port — and needs *less* of it: with syntax carried
+structurally, E-Call/E-Let/E-C/cc are already binary `state_e ⋈ peek_ctx`
+joins (the syntax match is a guard, not an atom), so only `var_read` and
+`copy_edge` are materialized. `tests/tuned_check.rs` verifies both compute the
+identical analysis.
+
+The effect on church(80): still ~25 k iterations, but the analysis SCC drops
+from 1.02 s to 61 ms (~48 µs/round → ~2.5 µs/round) — ~15× end-to-end, with no
+regression on the worst-case term. The residual ~2× vs. the delta worklist is
+the irreducible rounds-based dispatch: ~25 k rounds × ~55 rule variants, versus
+64 k events each processed once.
+
+**Takeaway.** The machines' advantage was never "Rust vs Datalog" — a worklist
+is *frontier-driven by construction*, while semi-naive evaluation is only
+frontier-driven if every rule variant can start from its delta. Meeting in the
+middle from both directions: the naive-but-clean step machine needs the
+work-set folklore just to avoid losing by 100×, the delta worklist that wins
+outright is hand-rolled semi-naive whose indices are exactly the tuned port's
+intermediate relations, and the tuned Datalog lands within ~2–3× of it while
+staying declarative (and winning outright on the join-heavy term). What
+Datalog is actually selling is that the safe point on this spectrum is the
+*default*: indexing and delta-driven evaluation come for free and degrade
+loudly (a slow benchmark) rather than silently (a quadratic worklist that
+looks fine on small tests).
+
 ## Performance: Ascent vs Soufflé, and thread scaling
 
 Measured on a 4-core sandbox. "Soufflé" is the compiled program with
@@ -287,71 +430,6 @@ Church benchmark.
   length-`m` vector context, so parallel Ascent is *slower in absolute terms*
   than sequential Ascent for these workloads — the sequential port is the one
   to beat. (`parallel_matches_sequential` checks the two agree.)
-
-## Is Datalog actually a win? A direct AAM implementation
-
-`src/aam.rs` implements the identical analysis with no Datalog at all, in
-textbook AAM style: a `State` is an eval configuration ⟨e, ctx, aκ⟩ or an apply
-configuration ⟨v, aκ⟩; `step` maps a state to its successors, one `match` arm
-per operational-semantics rule (with the same rule names as the `ascent!`
-block); a worklist runs the machine to its least fixpoint. It reuses the
-labelled syntax and abstract domains of the structured variant, so the two
-engines are directly comparable — `tests/aam_check.rs` checks they derive
-**content-identical** relations (states, both stores, and all four `flow_*`
-relations), on both labelings, at `m = 0/1/2`.
-
-Two things about the hand-written engine are *not* textbook small-step, both
-forced by the global (widened) store:
-
-* **Dependency re-firing.** A step that read a store address is stale if the
-  address later grows. The engine records readers per address and re-enqueues
-  them on growth — chaotic iteration, ~40 lines. This also quietly replaces the
-  Datalog `copy_ctx` relation: there, a flat-closure copy is a *standing*
-  subscription (`stored_val(x, to) ⊇ stored_val(x, from)`, forever); here the
-  applying state simply re-steps and re-copies when a source address grows.
-* **Work-set discipline.** The worklist is FIFO and deduplicated: a state woken
-  many times before it runs steps once, over the whole batch. This is what
-  stands in for semi-naive evaluation, and it is not optional — see below.
-
-**Benchmarks** (same occurrence-labelled term, `m = 1`, single thread; `mcfa
-aam N K P m` / `mcfa aam-church N m`):
-
-| term | Ascent (structured) | direct AAM | |
-|------|--------------------:|-----------:|---|
-| worst-case `N=10 K=3` | 0.78 s | 0.83 s | join-heavy |
-| worst-case `N=12 K=3` | 1.96 s | 2.27 s | |
-| church(40) | 0.18 s | 0.035 s | flow-heavy |
-| church(60) | 0.76 s | 0.104 s | |
-| church(80) | 2.21 s | 0.221 s | (Soufflé: 28.3 s) |
-
-Two regimes, opposite winners:
-
-* The **worst-case family is one giant join**: nearly all of its ~585 k facts
-  come from the product of `Prim2` continuations × arriving values. This is
-  Datalog's home turf — semi-naive evaluation with hash indices touches each
-  delta tuple once — and Ascent is ~15% *faster* than the direct machine, which
-  pays for batch re-scans and deep value clones.
-* **Church arithmetic is flow propagation**: many rules, small fan-outs, long
-  chains. The direct machine is **6–10× faster** here. It dispatches each state
-  through one `match`, touching exactly what changed, while the Datalog engine
-  pays per-iteration overhead across ~30 rules and maintains indices for every
-  relation column it might join on. Re-firing overhead stays small (~7–12%
-  extra steps).
-
-And a cautionary tale: this same machine with a plain LIFO stack and eager
-wakes (no dedup) computes the same fixpoint on `N=10 K=3` in **83 s** instead
-of 0.83 s — every hot reader re-scans its full fan-in once per arriving tuple,
-which is quadratic where the join is wide. The two lines of worklist folklore
-are load-bearing; forget them and Datalog wins by 100×.
-
-**Takeaway.** For this analysis Datalog's win is not raw speed — a direct
-machine of comparable length (~350 lines, and arguably closer to the
-operational semantics on the page) matches it on join-heavy adversarial terms
-and beats it substantially on realistic higher-order flow. The win is
-*robustness*: semi-naive evaluation and indexing come for free and never blow
-up asymptotically, whereas the hand-written engine silently degrades by 100×
-if the worklist discipline is wrong — and the failure mode (re-scan × fan-in)
-is exactly the kind that doesn't show up on small tests.
 
 ## Does representing syntax as ADTs regress Soufflé?
 

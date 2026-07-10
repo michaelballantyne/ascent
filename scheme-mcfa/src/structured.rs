@@ -186,7 +186,7 @@ pub enum SKont {
    Prim2 { op: Sym, v1: SValue, next_ak: SAddrK },
 }
 
-fn sextend(e: &E, old: &SCtx, m: usize) -> SCtx {
+pub(crate) fn sextend(e: &E, old: &SCtx, m: usize) -> SCtx {
    if m == 0 {
       return SCtx(Vec::new());
    }
@@ -196,7 +196,7 @@ fn sextend(e: &E, old: &SCtx, m: usize) -> SCtx {
    SCtx(v)
 }
 
-fn sif_true(v: &SValue) -> bool {
+pub(crate) fn sif_true(v: &SValue) -> bool {
    matches!(v, SValue::Closure { .. } | SValue::Number(_) | SValue::Kont(_))
       || matches!(v, SValue::Bool(b) if b.as_ref() == "#t")
 }

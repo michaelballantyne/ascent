@@ -25,6 +25,16 @@ fn main() {
          run_once(n, k, p, true);
       },
       "bench" => bench(),
+      "engines" => {
+         // Compare all in-process engines on one term at m=1.
+         let which = args.get(2).map(|s| s.as_str()).unwrap_or("worst");
+         let ast = if which == "church" {
+            scheme_mcfa::church_term(arg(&args, 3, 60))
+         } else {
+            worst_case_term(arg(&args, 3, 12), arg(&args, 4, 3), arg(&args, 5, 0))
+         };
+         engines(&ast, which);
+      },
       "church" => {
          let nn = arg(&args, 2, 8);
          let facts = Facts::from_ast(&scheme_mcfa::church_term(nn));
@@ -303,6 +313,84 @@ fn aam_vs_datalog(ast: &scheme_mcfa::Ast, name: &str, m: usize) {
       am.state_e + am.state_a,
       am.steps - (am.state_e + am.state_a)
    );
+}
+
+/// Compare every in-process engine on one term at `m = 1`: the three flat
+/// Datalog ports (faithful `ascent!`, tuned, generic vector-context), the two
+/// structured Datalog ports (labelled syntax; untuned and tuned), and the two
+/// hand-written machines (textbook step machine, event-driven delta worklist).
+/// Set MCFA_SUMMARY=1 to print ascent's per-SCC summaries for the item-macro
+/// programs.
+fn engines(ast: &scheme_mcfa::Ast, which: &str) {
+   use scheme_mcfa::{
+      analyze_aam, analyze_aam_delta, analyze_generic, analyze_structured, analyze_structured_tuned, to_expr_labeled,
+   };
+   let facts = Facts::from_ast(ast);
+   let top = to_expr_labeled(ast);
+   println!("engine comparison ({which}), m=1, {} input facts\n", facts.len());
+
+   let row = |name: &str, derived: usize, t: std::time::Duration| {
+      println!("  {name:<34} derived={derived:<8} time={t:>10.3?}");
+   };
+
+   // Ascent, flat id-relations: faithful ascent! port.
+   let mut p = facts.clone().into_program();
+   let t = Instant::now();
+   p.run();
+   let derived = p.state_e.len()
+      + p.state_a.len()
+      + p.stored_val.len()
+      + p.stored_kont.len()
+      + p.flow_ee.len()
+      + p.flow_ea.len()
+      + p.flow_ae.len()
+      + p.flow_aa.len();
+   row("ascent (flat, faithful)", derived, t.elapsed());
+   if std::env::var("MCFA_SUMMARY").is_ok() {
+      println!("--- ascent! scc summary ---\n{}", p.scc_times_summary());
+   }
+
+   // Ascent, flat: tuned (delta-friendly rules).
+   let mut pt = facts.clone().into_tuned_program();
+   let t = Instant::now();
+   pt.run();
+   let derived_t = pt.state_e.len()
+      + pt.state_a.len()
+      + pt.stored_val.len()
+      + pt.stored_kont.len()
+      + pt.flow_ee.len()
+      + pt.flow_ea.len()
+      + pt.flow_ae.len()
+      + pt.flow_aa.len();
+   row("ascent (flat, tuned)", derived_t, t.elapsed());
+   if std::env::var("MCFA_SUMMARY").is_ok() {
+      println!("--- tuned scc summary ---\n{}", pt.scc_times_summary());
+   }
+
+   // Ascent, flat: generic (ascent_run!, vector context).
+   let t = Instant::now();
+   let g = analyze_generic(&facts, 1);
+   row("ascent (flat, generic)", g.total_derived(), t.elapsed());
+
+   // Ascent, labelled structured syntax.
+   let t = Instant::now();
+   let s = analyze_structured(&top, 1);
+   row("ascent (structured)", s.total_derived(), t.elapsed());
+
+   // Ascent, labelled structured syntax, tuned.
+   let t = Instant::now();
+   let st = analyze_structured_tuned(&top, 1);
+   row("ascent (structured, tuned)", st.total_derived(), t.elapsed());
+
+   // Raw Rust: textbook step machine.
+   let t = Instant::now();
+   let a = analyze_aam(&top, 1);
+   row("AAM (step machine)", a.total_derived(), t.elapsed());
+
+   // Raw Rust: event-driven delta worklist.
+   let t = Instant::now();
+   let d = analyze_aam_delta(&top, 1);
+   row("AAM (delta worklist)", d.total_derived(), t.elapsed());
 }
 
 fn fmt_ctx(c: &Ctx) -> String { format!("$Context({})", c.0) }
