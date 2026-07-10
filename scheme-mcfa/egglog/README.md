@@ -116,13 +116,34 @@ no-op schedule):
   representation for this term family.
 * **On the deep Church terms egglog is frontier-blind at the *engine* level**
   — ~40–50× slower than tuned Ascent, ~2–3× slower even than *naive*
-  Ascent. `church(60)` needs 12,374 iterations; the report splits the time
-  as search+apply 520 ms / merge 55 ms / **rebuild 631 ms** — the post-round
-  congruence/index maintenance alone outweighs every rule body combined,
-  and neither is where a Datalog tuner can reach (see below). Per-round
-  overhead × tens of thousands of tiny rounds is the whole story, the same
-  diagnosis as the crate README's "frontier-blindness" — but here it is the
-  runtime's fixed cost per round, not a rescanned join.
+  Ascent. `church(60)` needs 12,374 iterations; the `--save-report` buckets
+  split the *measured* time as search+apply ~0.7 s / merge ~0.1 s /
+  **rebuild ~0.85 s**. Two accounting caveats, both discovered the hard
+  way: the buckets do **not** sum to wall time (per-iteration ruleset
+  assembly, report bookkeeping, and an O(#tables) index-reset sweep hidden
+  in the merge phase are all untimed), and `--save-report` itself costs
+  ~2 ms *per iteration* — a report-instrumented church(60) run takes ~35 s
+  against ~3.5 s plain (invisible on the worst-case term's 36 iterations,
+  10× on 12 k). Either way, per-round overhead × tens of thousands of tiny
+  rounds is the whole story — the crate README's "frontier-blindness"
+  diagnosis again, but as the runtime's fixed cost per round rather than a
+  rescanned join.
+* **The "rebuild" time is a pure no-op tax in this program — and an engine
+  version artifact.** This analysis never `union`s anything, so no id ever
+  becomes non-canonical: fresh constructor terms are minted from a counter
+  and hash-consed at insertion (`predict_val` dedups without unions), so
+  there is nothing for congruence closure to ever repair. The 2.0.0
+  release nonetheless calls `rebuild()` *unconditionally* every iteration
+  (`egglog-bridge-2.0.0`, `lib.rs:801`), and each call walks every table
+  with id-typed columns, refreshes its rebuild index, and scans the
+  recent-updates region — finding, every single time, nothing to do.
+  Upstream has since added exactly the right guard (skip rebuild when the
+  union-find didn't grow): rebuilt from `main` (July 2026), the same
+  program reports **rebuild = 0.000 s**. The punchline inverts, though:
+  main's reworked planner spends ~4× longer in search on this workload
+  (0.73 s → 3.0 s on church(60)), so it is *net slower* — worst-case
+  0.63 s → 0.93 s, church(80) 7.0 s → 12.3 s. The table above uses the
+  released 2.0.0 throughout.
 * **Parallelism follows the same split**: `-j4` shaves ~20% off the
   worst-case term (0.63 s → ~0.52 s) but makes the Church terms ~2.3×
   *slower* (church(60) 3.6 s → 8.3 s, church(80) 7.0 s → 15.3 s) — with ~3
@@ -167,10 +188,13 @@ So the straightforward port *is* the tuned port: its rule shape is already
 delta-driven everywhere Ascent needed hand-splitting (egglog's planner
 handles the delta-on-third-atom variants fine — E-Call/E-Let cost almost
 nothing in the profile), and the residual Church-term gap sits in per-round
-rebuild machinery that rule-level rewrites can only add to. A fair summary:
-**egglog gives you the tuned-Datalog join behaviour by default, but its
-e-graph bookkeeping prices every round as if you might have unioned
-something — which this analysis never does.**
+engine machinery — no-op rebuild scans (2.0.0), per-iteration ruleset
+assembly, index resets — that rule-level rewrites can only add to. A fair
+summary: **egglog gives you the tuned-Datalog join behaviour by default,
+but in the 2.0.0 release its e-graph bookkeeping prices every round as if
+you might have unioned something — which this analysis never does.
+Upstream `main` already skips that no-op rebuild (measured: 0.000 s), but
+its current planner gives the savings back in search time, and then some.**
 
 ## egglog quirks encountered
 

@@ -505,12 +505,17 @@ Three findings worth pulling out:
 * **egglog cannot be tuned out of its Church-term deficit — the rewrites
   that give 15× (Ascent) and 148× (Soufflé) make egglog *slower*.** Its
   rounds are synchronized, so intermediate relations add a round of latency
-  per event (+50% iterations), and its e-graph rebuild pass — 631 ms of
-  church(60)'s ~1.2 s, more than all rule matching combined — scales with
-  table count. The engine gives you tuned-join behaviour by default and
-  charges a congruence-maintenance tax you can't opt out of, ~40–50× tuned
-  Ascent on deep terms. There is deliberately no `mcfa_tuned.egg`
-  (`egglog/README.md` documents the negative results).
+  per event (+50% iterations), and every extra table raises a per-round
+  engine floor (rebuild scans, index resets) that a 12 k-iteration
+  tiny-frontier fixpoint pays 12 k times — ~40–50× tuned Ascent on deep
+  terms. The "rebuild" share turns out to be a pure no-op tax on this
+  program (nothing is ever unioned, so congruence closure never has work)
+  *and* an engine-version artifact: the 2.0.0 release runs the rebuild
+  scan unconditionally each round, while upstream `main` skips it when the
+  union-find hasn't grown (measured: rebuild 0.000 s) — but main's current
+  planner is ~4× slower in search here, so it loses net. There is
+  deliberately no `mcfa_tuned.egg` (`egglog/README.md` documents the
+  negative results and the bucket-vs-wall-clock measurement pitfalls).
 * **Flix's engine is orders of magnitude off the pace on every term** —
   ~13× tuned Ascent on the worst-case term and ~3000× on church(60)
   (naive), with the tuned rewrite recovering 2–4× on Church terms and
