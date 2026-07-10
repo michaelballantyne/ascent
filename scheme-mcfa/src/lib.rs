@@ -35,10 +35,12 @@ use ascent::ascent;
 pub mod ast;
 pub mod edb;
 pub mod generic;
+pub mod structured;
 
 pub use ast::{Ast, Sym, feature_term, worst_case_term};
 pub use edb::Facts;
 pub use generic::{GenericStats, analyze_generic};
+pub use structured::{StructuredStats, analyze_structured, to_expr};
 
 /// `context = Context{ctx0:id}` — a length-1 contour of expression ids.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]

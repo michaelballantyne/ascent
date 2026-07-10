@@ -31,6 +31,13 @@ fn main() {
          let p = arg(&args, 4, 0);
          cfa_sweep(n, k, p);
       }
+      "structured" => {
+         let n = arg(&args, 2, 8);
+         let k = arg(&args, 3, 2);
+         let p = arg(&args, 4, 0);
+         let m = arg(&args, 5, 1);
+         structured_vs_flat(n, k, p, m);
+      }
       "emit-souffle" => {
          let dir = args.get(2).cloned().unwrap_or_else(|| {
             eprintln!("emit-souffle needs a target DIR");
@@ -115,6 +122,41 @@ fn cfa_sweep(n: usize, k: usize, p: usize) {
       let elapsed = start.elapsed();
       println!("{:>3}  {:>12}  {:>12.3?}", m, stats.total_derived(), elapsed);
    }
+}
+
+/// Variation: compare the structured-syntax analysis against the flat
+/// (id-relation) analysis on the same source term, at the same `m`.
+fn structured_vs_flat(n: usize, k: usize, p: usize, m: usize) {
+   use scheme_mcfa::{Facts, analyze_generic, analyze_structured, to_expr, worst_case_term};
+   let ast = worst_case_term(n, k, p);
+
+   let t0 = Instant::now();
+   let flat = analyze_generic(&Facts::from_ast(&ast), m);
+   let flat_t = t0.elapsed();
+
+   let t1 = Instant::now();
+   let structured = analyze_structured(&to_expr(&ast), m);
+   let structured_t = t1.elapsed();
+
+   println!("term N={n} K={k} P={p}, m={m}\n");
+   println!("{:<14} {:>14} {:>14}", "relation", "flat (ids)", "structured");
+   let rows = [
+      ("state_e", flat.state_e, structured.state_e),
+      ("state_a", flat.state_a, structured.state_a),
+      ("stored_val", flat.stored_val, structured.stored_val),
+      ("stored_kont", flat.stored_kont, structured.stored_kont),
+      ("flow_ee", flat.flow_ee, structured.flow_ee),
+      ("flow_ea", flat.flow_ea, structured.flow_ea),
+      ("flow_ae", flat.flow_ae, structured.flow_ae),
+      ("flow_aa", flat.flow_aa, structured.flow_aa),
+      ("peek_ctx", flat.peek_ctx, structured.peek_ctx),
+      ("copy_ctx", flat.copy_ctx, structured.copy_ctx),
+   ];
+   for (name, a, b) in rows {
+      println!("{name:<14} {a:>14} {b:>14}");
+   }
+   println!("{:<14} {:>14} {:>14}", "total derived", flat.total_derived(), structured.total_derived());
+   println!("{:<14} {:>14.3?} {:>14.3?}", "time", flat_t, structured_t);
 }
 
 fn fmt_ctx(c: &Ctx) -> String { format!("$Context({})", c.0) }
