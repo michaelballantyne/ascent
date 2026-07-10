@@ -38,6 +38,7 @@ pub mod edb;
 pub mod generic;
 pub mod parallel;
 pub mod structured;
+pub mod tuned;
 
 pub use aam::{AamStats, analyze_aam};
 pub use ast::{Ast, Sym, church_term, feature_term, worst_case_term, worst_case_term_single};
@@ -45,6 +46,7 @@ pub use edb::Facts;
 pub use generic::{GenericStats, analyze_generic};
 pub use parallel::analyze_generic_par;
 pub use structured::{StructuredStats, analyze_structured, to_expr};
+pub use tuned::McfaTuned;
 
 /// `context = Context{ctx0:id}` — a length-1 contour of expression ids.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -98,7 +100,7 @@ fn ff() -> Sym { Arc::from("#f") }
 /// The set of values the appendix treats as "true" in the A-IfT rule: any
 /// value except `#f` (and except `PrimVal`, which — faithfully to the paper —
 /// the appendix's A-If rules do not handle).
-fn if_true(v: &Value) -> bool {
+pub(crate) fn if_true(v: &Value) -> bool {
    matches!(
       v,
       Value::Closure { .. } | Value::Number(_) | Value::Kont(_)

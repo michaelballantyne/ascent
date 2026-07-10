@@ -39,12 +39,14 @@ This crate:
 | `src/structured.rs` | **Variation:** syntax represented as a recursive `Expr` enum matched structurally in the rules, instead of flat id-relations (`analyze_structured`). |
 | `src/parallel.rs` | The generic analysis via `ascent_run_par!` (`analyze_generic_par`), for thread-scaling measurements. |
 | `src/aam.rs` | A **hand-written AAM worklist** reference implementation — no Datalog, just a global store and an event-driven worklist (`analyze_aam`). |
+| `src/tuned.rs` | The faithful port with **delta-friendly rules** (guards after joins, 3-atom joins split via materialized reader-index relations) — ~21× faster on deep terms. |
 | `src/main.rs` | CLI runner / benchmarks. |
 | `souffle/mcfa.dl` | The original Soufflé program, transcribed verbatim from Appendix A (only change: Soufflé 2.4.1 spells the nullary constructor `$MT()`). |
 | `souffle/mcfa_adt.dl` | **Experiment:** a Soufflé version that carries syntax as an `expr` ADT instead of flat relations, to test whether ADTs regress performance. |
 | `tests/cross_check.rs` | Runs Ascent and Soufflé on the same input and asserts the outputs agree. |
 | `tests/generic_check.rs` | Checks generic `m=1` ≡ the faithful port, reproduces the polyvariance/padding phenomena, and checks parallel ≡ sequential. |
 | `tests/aam_check.rs` | Checks the hand-written AAM computes bit-for-bit the same relations as the Datalog, at `m ∈ {0,1,2}`. |
+| `tests/tuned_check.rs` | Checks the tuned program computes the identical analysis to the faithful port (sizes + `stored_val`/`flow_ee` content). |
 | `tests/structured_check.rs` | Checks the structured variant against the flat one (identical on duplicate-free terms; conflating on repeated subterms). |
 
 ## Running
@@ -232,46 +234,83 @@ Machine directly in Rust: a global value store and continuation store
 (all sizes and `flow_ee` content, at `m ∈ {0,1,2}`).
 
 Comparing all engines at `m = 1` (single thread; Soufflé is the compiled
-`.printsize` binary; "ascent!" is the faithful item-macro port, "generic" is the
+`.printsize` binary; "ascent!" is the faithful item-macro port, "tuned" is the
+same program with delta-friendly rules — see below; "generic" is the
 `ascent_run!` version with a length-`m` vector context):
 
-| term | Soufflé | ascent! | ascent generic | **AAM (raw Rust)** |
-|------|---------|---------|----------------|--------------------|
-| worst-case `N=12 K=3 P=0` | 2.05 s | 1.70 s | 10.3 s | **2.42 s** |
-| church(60) | 8.95 s | 1.11 s | 1.93 s | **0.056 s** |
-| church(80) | 28.3 s | 3.28 s | 5.22 s | **0.058 s** |
+| term | Soufflé | ascent! | **ascent tuned** | ascent generic | **AAM (raw Rust)** |
+|------|---------|---------|------------------|----------------|--------------------|
+| worst-case `N=12 K=3 P=0` | 2.05 s | 1.92 s | 1.78 s | 4.0 s | 2.82 s |
+| church(60) | 8.95 s | 1.17 s | **0.091 s** | 1.87 s | **0.045 s** |
+| church(80) | 28.3 s | 3.21 s | **0.155 s** | 5.33 s | **0.082 s** |
 
 Two very different regimes:
 
 * On the **value-domain-dominated** worst-case term (the cost is the `PrimVal`
-  blow-up), all four engines are within ~5× of each other — the work is
-  irreducible set-manipulation of large nested values, and the Datalog engines'
-  indexed joins are as good as the hand-written loop (Ascent's item macro is
-  actually the fastest).
-* On the **closure-flow-dominated** Church benchmark the AAM is **1–3 orders of
-  magnitude faster** (≈57× vs faithful Ascent, ≈490× vs Soufflé on church(80)).
+  blow-up), all engines are within ~3× — the work is irreducible
+  set-manipulation of large nested values and the indexed joins are as good as
+  the hand-written loop.
+* On the **closure-flow-dominated** Church benchmark the naive ports are 1–2
+  orders of magnitude slower than the AAM — but the *tuned* Ascent program
+  closes most of that gap (3.21 s → 0.155 s, within ~2× of the AAM).
 
-It is *not* free-variable precomputation that makes the difference — `freevar`
-depends only on the syntax (EDB) relations, so it is a lower stratum / separate
-SCC that the Datalog engines also saturate exactly once, and instrumenting the
-AAM (`MCFA_TIMING=1`) shows its `Program`+`freevar` setup is ~4 ms of the
-~63 ms church(80) run; the other ~46 ms is the worklist fixpoint itself. The
-difference is the **fixpoint engine's per-fact overhead**. Ascent/Soufflé
-maintain each relation as indexed structures with semi-naive delta bookkeeping
-over one big mutually-recursive SCC; Church's deeply nested, curried structure
-gives long derivation chains, so that SCC takes many saturation rounds, each
-paying per-relation overhead. Measured per-derived-fact cost bears this out:
-Ascent spends ~2.9 µs/fact on the (wide, shallow) worst-case term but ~51 µs/fact
-on the (deep) church(80) term, while the worklist — which touches each fact once
-regardless of chain depth — stays around 0.7 µs/fact. On the shallow worst-case
-term there are few rounds, so the Datalog engines are competitive (and Ascent's
-item macro is actually fastest).
+### Why: diagnosing the gap
 
-The takeaway is roughly the paper's framing in reverse: Datalog buys a
-*declarative, parallelizable, and competitive* implementation almost for free,
-but for a fixed analysis a hand-tuned AAM worklist can still dominate on
-deep/recursive workloads where the generic relational saturation is overhead.
-(`src/aam.rs` prints the setup-vs-worklist split under `MCFA_TIMING=1`.)
+It is *not* free-variable precomputation — `freevar` is a lower stratum that
+the Datalog engines also saturate once (166 iterations, 9 ms on church(80);
+the AAM's setup is likewise ~4 ms, visible under `MCFA_TIMING=1`).
+
+The diagnosis comes from `MCFA_SUMMARY=1`, which prints Ascent's
+`scc_times_summary()` (per-SCC iteration counts, and per-rule times when
+`#![measure_rule_times]` is enabled):
+
+* On church(80) the analysis SCC runs **21,273 iterations** deriving 64,334
+  facts — **~3 new facts per iteration**. The deep curried structure makes the
+  dataflow frontier tiny; the fixpoint crawls, one abstract machine step per
+  round. (Worst-case `N=12`: 35 iterations, ~16,700 facts each — wide frontier,
+  join work dominates, everything is fine.)
+* Per-rule times show ~2.99 s of the 3.17 s concentrated in **four rule
+  variants**, all with the same shape: the semi-naive variant whose delta is on
+  a *later* body atom scans a big `total` index every round:
+  - `state_a(v, ak), if gif_true(v), stored_kont(ak, ?If{..})` — the guard
+    *between* the atoms defeats Ascent's runtime-reorderable simple join, so the
+    delta=`stored_kont` variant iterates **all of `state_a`** (`indices_none`)
+    each round. Same for the `?Closure` pattern in A-C/cc's first atom.
+  - `state_e ⋈ call ⋈ peek_ctx` and `state_e ⋈ var ⋈ stored_val` — 3-atom
+    rules: the variant with the delta on the third atom re-enumerates the whole
+    2-atom prefix join each round.
+
+  21,273 rounds × O(all states) ≈ quadratic. The AAM never rescans: it keeps
+  *reverse* dependency indices (address → waiting variable-reads, kont-address →
+  applied values, context → copy-edges), so each new fact touches exactly its
+  readers.
+
+### The fix is expressible in the rules (`src/tuned.rs`)
+
+`McfaTuned` is the same analysis with three mechanical rewrites:
+
+1. **guards/patterns moved after the joins** (`state_a(v, ak),
+   stored_kont(ak, ?If{..}), if gif_true(v)`) — the two-atom join is then a
+   simple join that Ascent evaluates from whichever side is smaller (the delta);
+2. **3-atom joins split into binary joins** via intermediate relations
+   (`app_state`, `let_state`, `callcc_state`, `var_read`, `copy_edge`) — these
+   intermediates *are* the AAM's reader indices, materialized as relations;
+3. **`stored_val`'s address flattened** to columns (`x, ctx, v`) so the store
+   joins by key from either side.
+
+`tests/tuned_check.rs` verifies it computes the identical analysis. The effect
+on church(80): still ~25k iterations, but **5.5 µs/round instead of 154
+µs/round** — 3.21 s → 0.155 s (~21×), with no regression on the worst-case
+term. The residual ~2× vs the AAM is the irreducible rounds-based dispatch:
+~25k rounds × ~55 rule variants, versus the worklist's 64k events each
+processed once.
+
+The takeaway: the AAM's advantage was never "Rust vs Datalog" — it is that a
+worklist is *frontier-driven by construction*, while semi-naive evaluation is
+only frontier-driven if every rule variant can be joined starting from its
+delta. Written with that in mind, the declarative Ascent program lands within
+~2× of the hand-written machine (and remains parallelizable and 180× faster
+than compiled Soufflé on this benchmark).
 
 ## Performance: Ascent vs Soufflé, and thread scaling
 

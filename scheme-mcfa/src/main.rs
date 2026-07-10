@@ -41,6 +41,19 @@ fn main() {
          let derived = p.state_e.len() + p.state_a.len() + p.stored_val.len() + p.stored_kont.len()
             + p.flow_ee.len() + p.flow_ea.len() + p.flow_ae.len() + p.flow_aa.len();
          println!("  {:<26} derived={derived:<8} time={:>10.3?}", "ascent (Datalog, ascent!)", t.elapsed());
+         if std::env::var("MCFA_SUMMARY").is_ok() {
+            println!("--- ascent! scc summary ---\n{}", p.scc_times_summary());
+         }
+         // Ascent (tuned: delta-friendly rules)
+         let mut pt = facts.clone().into_tuned_program();
+         let t = Instant::now();
+         pt.run();
+         let derived_t = pt.state_e.len() + pt.state_a.len() + pt.stored_val.len() + pt.stored_kont.len()
+            + pt.flow_ee.len() + pt.flow_ea.len() + pt.flow_ae.len() + pt.flow_aa.len();
+         println!("  {:<26} derived={derived_t:<8} time={:>10.3?}", "ascent (Datalog, tuned)", t.elapsed());
+         if std::env::var("MCFA_SUMMARY").is_ok() {
+            println!("--- tuned scc summary ---\n{}", pt.scc_times_summary());
+         }
          // Ascent (generic, ascent_run!, Vec ctx)
          let t = Instant::now();
          let g = scheme_mcfa::analyze_generic(&facts, 1);
