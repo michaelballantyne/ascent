@@ -1,0 +1,408 @@
+// Soufflé version of the m-CFA analysis with per-version query plans.
+//
+// Same analysis as mcfa.dl (Appendix A), tuned the same way as the Ascent
+// `McfaTuned` program — but using Soufflé's `.plan` directive, which schedules
+// each semi-naive *version* of a rule separately: version k has the delta on
+// the k-th recursive body atom, and the plan permutes the body so that version
+// starts from its delta instead of scanning a total index every iteration.
+//
+// Two mechanical changes were required to attach plans:
+// * `.plan` is rejected on clauses whose head is non-recursive, and Soufflé
+//   clones multi-head rules per head — the `flow_*` relations never appear in
+//   rule bodies, so their clones are non-recursive. The flow_* heads are
+//   therefore split into separate, unplanned rules (their stratum runs once,
+//   after the fixpoint).
+// * `.plan` cannot attach to a disjunctive rule, so the A-IfT disjunction is
+//   expanded into four rules.
+//
+// The rule bodies and all relations are otherwise identical to mcfa.dl, and
+// the output relations are identical.
+
+.type id <: symbol
+.type context = Context{ctx0:id}
+.type value = Number { n : number }
+            | Bool { b : symbol }
+            | Kont { k : address_k }
+            | Closure { e: id, ctx: context }
+            | PrimVal {op: id , v1: value , v2: value}
+.type kont = MT {}
+           | Arg {args: id, ctx: context, ectx: context, next_ak: address_k}
+           | Fn {fn: value, pos: number, ctx: context, next_ak: address_k}
+           | Set {loc: address_v, next_ak: address_k}
+           | If {true_branch: id, false_branch: id, ctx: context, next_ak: address_k}
+           | Callcc {ectx: context, next_ak: address_k}
+           | Let {av: address_v, ebody: id, ctx: context, next_ak: address_k}
+           | Prim1 {op: id, e2: id, ctx: context, next_ak: address_k}
+           | Prim2 {op: id, v1: value, next_ak: address_k}
+.type address_k = KAddress{e: id, ctx: context}
+.type address_v = VAddress{x: symbol, ctx: context}
+
+.decl state_e(e: id, ctx: context, ak: address_k)
+.output state_e
+.decl state_a(v: value, ak: address_k)
+.output state_a
+.decl stored_val(av: address_v, v: value)
+.output stored_val
+// Internal flattened store: Soufflé cannot drive an index probe from a
+// freshly-constructed record key (`stored_val($VAddress(x, ctx), v)` with v
+// free compiles to a full scan + unpack + filter), so the store is kept
+// flattened into columns internally and reconstructed once for output.
+.decl stored_val_f(x: symbol, ctx: context, v: value)
+stored_val($VAddress(x, ctx), v) :- stored_val_f(x, ctx, v).
+.decl stored_kont(ak: address_k, k: kont)
+.output stored_kont
+
+.decl lambda(Id: id, Vars: id, BodyId: id)
+.input lambda
+.decl lambda_arg_list(Id: id, Pos: number, X: symbol)
+.input lambda_arg_list
+.decl prim(Id: id, OpName: symbol)
+.input prim
+.decl prim_call(Id: id, PrimId: id, Args: id)
+.input prim_call
+.decl call(Id: id, FuncId: id, Args: id)
+.input call
+.decl call_arg_list(Id: id, Pos: number, X: id)
+.input call_arg_list
+.decl var(Id: id, MetaName: symbol)
+.input var
+.decl num(Id: id, v: number)
+.input num
+.decl bool(Id: id, v: symbol)
+.input bool
+.decl quotation(Id: id, Expr: id)
+.input quotation
+
+.decl value_form(Id: id)
+value_form(id) :-
+    (num(id, _); var(id, _); lambda(id, _, _); quotation(id, _); bool(id, _)).
+
+.decl if(Id:id, GuardId: id, TrueId: id, False: id)
+.input if
+.decl setb(Id: id, Var: symbol, ExprId: id)
+.input setb
+.decl callcc(Id: id, ExprId: id)
+.input callcc
+.decl let(Id: id, BindId: id, BodyId: id)
+.input let
+.decl let_list(Id: id, X: symbol, EId: id)
+.input let_list
+.decl top_exp(Id: id)
+.input top_exp
+
+.decl freevar(x:symbol, e: id)
+.output freevar
+freevar(x, e) :- var(e, x).
+freevar(x, e) :-
+    lambda(e, vars, body),
+    freevar(x, body),
+    !lambda_arg_list(vars, _, x).
+freevar(x, e) :-
+    call(e, func, args),
+    (freevar(x, func); freevar(x, args)).
+freevar(x, e) :-
+    prim_call(e, _, args),
+    freevar(x, args).
+freevar(x, e) :-
+    call_arg_list(e, pos, arg),
+    freevar(x, arg).
+freevar(x, e) :-
+    if(e, eguard, et, ef),
+    (freevar(x, eguard); freevar(x, et); freevar(x, ef)).
+freevar(y, e) :-
+    setb(e, _, ev),
+    freevar(y, ev).
+freevar(x, e) :-
+    callcc(e, ev),
+    freevar(x, ev).
+freevar(x, e) :-
+    let(e, binds, body),
+    (freevar(x, binds); freevar(x, body)).
+freevar(x, e) :-
+    let_list(e, a, bind),
+    !let_list(e, x, _),
+    freevar(x, bind).
+
+.decl flow_ee(e1: id, e2: id)
+.output flow_ee
+.decl flow_ea(e1: id, a2: value)
+.output flow_ea
+.decl flow_aa(a1: value, a2: value)
+.output flow_aa
+.decl flow_ae(a1: value, e2: id)
+.output flow_ae
+
+.decl peek_ctx(e: id, ctx_old: context, ctx_new: context)
+.output peek_ctx
+.decl copy_ctx(from: context, to: context, e:id)
+.output copy_ctx
+
+// ---- injection (non-recursive body: no plan) ----
+state_e(e, $Context(""), $KAddress(e, $Context(""))),
+peek_ctx(e, $Context(""), $Context(e)),
+stored_kont($KAddress(e, $Context("")), $MT()) :-
+    top_exp(e).
+
+// ---- peek_ctx (one recursive atom: default schedule is delta-driven) ----
+peek_ctx(e, $Context(ctx0), $Context(e)) :-
+    state_e(e, $Context(ctx0), _),
+    (callcc(e, _) ; call(e, _, _)
+    ; let(e, _, _); lambda(e,_,_)).
+
+// ---- flat-closure copy: version 1 (delta = stored_val) starts from the store ----
+stored_val_f(fv, to, v) :-
+    copy_ctx(from, to, e),
+    freevar(fv, e),
+    stored_val_f(fv, from, v).
+.plan 0: (1,2,3), 1: (3,2,1)
+
+// ---- E-If (one recursive atom) ----
+state_e(eguard, ctx, $KAddress(eguard, ctx)),
+stored_kont($KAddress(eguard, ctx), $If(et, ef, ctx, ak)) :-
+    state_e(e, ctx, ak),
+    if(e, eguard, et, ef).
+
+flow_ee(e, eguard) :-
+    state_e(e, _, _),
+    if(e, eguard, _, _).
+
+// ---- E-C/cc: version 1 (delta = peek_ctx) starts from the new context ----
+state_e(elam, ctx, $KAddress(elam, ctx)),
+stored_kont($KAddress(elam, ctx), $Callcc(ectx, ak)) :-
+    state_e(e, ctx, ak),
+    callcc(e, elam),
+    peek_ctx(e, ctx, ectx).
+.plan 0: (1,2,3), 1: (3,1,2)
+
+flow_ee(e, elam) :-
+    state_e(e, ctx, _),
+    callcc(e, elam),
+    peek_ctx(e, ctx, _).
+
+// ---- E-Set! (one recursive atom) ----
+state_e(esetto, ctx, $KAddress(esetto, ctx)),
+stored_kont($KAddress(esetto, ctx), $Set($VAddress(x, ctx), ak)) :-
+    state_e(e, ctx, ak),
+    setb(e, x, esetto).
+
+flow_ee(e, esetto) :-
+    state_e(e, _, _),
+    setb(e, _, esetto).
+
+// ---- E-Call: version 1 (delta = peek_ctx) ----
+state_e(efunc, ctx, $KAddress(efunc, ctx)),
+stored_kont($KAddress(efunc, ctx), $Arg(eargs, ctx, ectx, ak)) :-
+    state_e(e, ctx, ak),
+    call(e, efunc, eargs),
+    peek_ctx(e, ctx, ectx).
+.plan 0: (1,2,3), 1: (3,1,2)
+
+flow_ee(e, efunc) :-
+    state_e(e, ctx, _),
+    call(e, efunc, _),
+    peek_ctx(e, ctx, _).
+
+// ---- E-Let: version 1 (delta = peek_ctx) ----
+state_e(ebnd, ctx, $KAddress(ebnd, ctx)),
+stored_kont($KAddress(ebnd, ctx), $Let($VAddress(x, ectx), ebody, ectx, ak)),
+copy_ctx(ctx, ectx, e) :-
+    state_e(e, ctx, ak),
+    let(e, ll, ebody),
+    let_list(ll, x, ebnd),
+    peek_ctx(e, ctx, ectx).
+.plan 0: (1,2,3,4), 1: (4,1,2,3)
+
+flow_ee(e, ebnd) :-
+    state_e(e, ctx, _),
+    let(e, ll, _),
+    let_list(ll, _, ebnd),
+    peek_ctx(e, ctx, _).
+
+// ---- E-Prim (one recursive atom) ----
+state_e(earg0, ctx, $KAddress(earg0, ctx)),
+stored_kont($KAddress(earg0, ctx), $Prim1(op, earg1, ctx, ak)) :-
+    state_e(e, ctx, ak),
+    prim_call(e, op, pl),
+    call_arg_list(pl, 0, earg0),
+    call_arg_list(pl, 1, earg1).
+
+flow_ee(e, earg0) :-
+    state_e(e, _, _),
+    prim_call(e, _, pl),
+    call_arg_list(pl, 0, earg0).
+
+// ---- atomic evaluation (one recursive atom each) ----
+state_a($Number(n), ak) :-
+    state_e(e, _, ak),
+    num(e, n).
+flow_ea(e, $Number(n)) :-
+    state_e(e, _, _),
+    num(e, n).
+
+state_a($Bool(b), ak) :-
+    state_e(e, _, ak),
+    bool(e, b).
+flow_ea(e, $Bool(b)) :-
+    state_e(e, _, _),
+    bool(e, b).
+
+state_a($Closure(e, ctx), ak) :-
+    state_e(e, ctx, ak),
+    lambda(e, _, _).
+flow_ea(e, $Closure(e, ctx)) :-
+    state_e(e, ctx, _),
+    lambda(e, _, _).
+
+// E-AE for variables: version 1 (delta = stored_val) starts from the store
+state_a(v, ak) :-
+    state_e(e, ctx, ak),
+    var(e, x),
+    stored_val_f(x, ctx, v).
+.plan 0: (1,2,3), 1: (3,2,1)
+
+flow_ea(e, v) :-
+    state_e(e, ctx, _),
+    var(e, x),
+    stored_val_f(x, ctx, v).
+
+// ---- A-IfT: disjunction expanded so plans can attach; version 1 drives from the kont ----
+state_e(et, ctx_k, next_ak) :-
+    state_a($Bool("#t"), ak),
+    stored_kont(ak, $If(et, _, ctx_k, next_ak)).
+.plan 0: (1,2), 1: (2,1)
+
+state_e(et, ctx_k, next_ak) :-
+    state_a($Closure(_,_), ak),
+    stored_kont(ak, $If(et, _, ctx_k, next_ak)).
+.plan 0: (1,2), 1: (2,1)
+
+state_e(et, ctx_k, next_ak) :-
+    state_a($Number(_), ak),
+    stored_kont(ak, $If(et, _, ctx_k, next_ak)).
+.plan 0: (1,2), 1: (2,1)
+
+state_e(et, ctx_k, next_ak) :-
+    state_a($Kont(_), ak),
+    stored_kont(ak, $If(et, _, ctx_k, next_ak)).
+.plan 0: (1,2), 1: (2,1)
+
+flow_ae($Bool("#t"), et) :-
+    (state_a($Bool("#t"), ak) ; state_a($Closure(_,_), ak)
+    ; state_a($Number(_), ak) ; state_a($Kont(_), ak)),
+    stored_kont(ak, $If(et, _, _, _)).
+
+// ---- A-IfF ----
+state_e(ef, ctx_k, next_ak) :-
+    state_a($Bool("#f"), ak),
+    stored_kont(ak, $If(_, ef, ctx_k, next_ak)).
+.plan 0: (1,2), 1: (2,1)
+
+flow_ae($Bool("#f"), ef) :-
+    state_a($Bool("#f"), ak),
+    stored_kont(ak, $If(_, ef, _, _)).
+
+// ---- A-C/cc: version 1 drives from the kont ----
+state_e(ebody, ectx, next_ak),
+stored_val_f(x, ectx, $Kont(ak)),
+copy_ctx(ctx_clo, ectx, elam) :-
+    state_a($Closure(elam, ctx_clo), ak),
+    stored_kont(ak, $Callcc(ectx, next_ak)),
+    lambda(elam, params, ebody),
+    lambda_arg_list(params, 0, x).
+.plan 0: (1,2,3,4), 1: (2,1,3,4)
+
+flow_ae($Closure(elam, ctx_clo), ebody) :-
+    state_a($Closure(elam, ctx_clo), ak),
+    stored_kont(ak, $Callcc(_, _)),
+    lambda(elam, _, ebody).
+
+// ---- A-C/ccKont ----
+state_a($Kont(ak), bk) :-
+    state_a($Kont(bk), ak),
+    stored_kont(ak, $Callcc(_, _)).
+.plan 0: (1,2), 1: (2,1)
+
+flow_aa($Kont(bk), $Kont(ak)) :-
+    state_a($Kont(bk), ak),
+    stored_kont(ak, $Callcc(_, _)).
+
+// ---- A-Ar: version 1 drives from the kont ----
+state_e(earg, ctx, $KAddress(earg, ctx)),
+stored_kont($KAddress(earg, ctx), $Fn(v, pos, ectx, next_ak)) :-
+    state_a(v, ak),
+    stored_kont(ak, $Arg(eargs, ctx, ectx, next_ak)),
+    call_arg_list(eargs, pos, earg).
+.plan 0: (1,2,3), 1: (2,1,3)
+
+flow_ae(v, earg) :-
+    state_a(v, ak),
+    stored_kont(ak, $Arg(eargs, _, _, _)),
+    call_arg_list(eargs, _, earg).
+
+// ---- A-Call: version 1 drives from the kont ----
+state_e(ebody, ectx, next_ak),
+stored_val_f(x, ectx, v),
+copy_ctx(ctx_clo, ectx, elam) :-
+    state_a(v, ak),
+    stored_kont(ak, $Fn($Closure(elam, ctx_clo), pos, ectx, next_ak)),
+    lambda(elam, params, ebody),
+    lambda_arg_list(params, pos, x).
+.plan 0: (1,2,3,4), 1: (2,1,3,4)
+
+flow_ae(v, ebody) :-
+    state_a(v, ak),
+    stored_kont(ak, $Fn($Closure(elam, _), _, _, _)),
+    lambda(elam, _, ebody).
+
+// ---- A-Call (continuation as operator) ----
+state_a(v, callcc_kont) :-
+    state_a(v, ak),
+    stored_kont(ak, $Fn($Kont(callcc_kont), 0, _, _)).
+.plan 0: (1,2), 1: (2,1)
+
+flow_aa(v, v) :-
+    state_a(v, ak),
+    stored_kont(ak, $Fn($Kont(_), 0, _, _)).
+
+// ---- A-Let ----
+state_e(ebody, ctx, next_ak),
+stored_val_f(avx, avctx, v) :-
+    state_a(v, ak),
+    stored_kont(ak, $Let($VAddress(avx, avctx), ebody, ctx, next_ak)).
+.plan 0: (1,2), 1: (2,1)
+
+flow_ae(v, ebody) :-
+    state_a(v, ak),
+    stored_kont(ak, $Let(_, ebody, _, _)).
+
+// ---- A-Prim1 ----
+state_e(earg1, ctx, $KAddress(earg1, ctx)),
+stored_kont($KAddress(earg1, ctx), $Prim2(op, v, next_ak)) :-
+    state_a(v, ak),
+    stored_kont(ak, $Prim1(op, earg1, ctx, next_ak)).
+.plan 0: (1,2), 1: (2,1)
+
+flow_ae(v, earg1) :-
+    state_a(v, ak),
+    stored_kont(ak, $Prim1(_, earg1, _, _)).
+
+// ---- A-Prim2 ----
+state_a($PrimVal(op, v1, v2), next_ak) :-
+    state_a(v2, ak),
+    stored_kont(ak, $Prim2(op, v1, next_ak)).
+.plan 0: (1,2), 1: (2,1)
+
+flow_aa(v2, $PrimVal(op, v1, v2)) :-
+    state_a(v2, ak),
+    stored_kont(ak, $Prim2(op, v1, _)).
+
+// ---- A-Set! ----
+state_a($Number(-42), next_ak),
+stored_val_f(locx, locctx, v) :-
+    state_a(v, ak),
+    stored_kont(ak, $Set($VAddress(locx, locctx), next_ak)).
+.plan 0: (1,2), 1: (2,1)
+
+flow_aa(v, $Number(-42)) :-
+    state_a(v, ak),
+    stored_kont(ak, $Set(_, _)).

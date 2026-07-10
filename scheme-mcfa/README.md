@@ -43,6 +43,7 @@ This crate:
 | `src/main.rs` | CLI runner / benchmarks. |
 | `souffle/mcfa.dl` | The original Soufflé program, transcribed verbatim from Appendix A (only change: Soufflé 2.4.1 spells the nullary constructor `$MT()`). |
 | `souffle/mcfa_adt.dl` | **Experiment:** a Soufflé version that carries syntax as an `expr` ADT instead of flat relations, to test whether ADTs regress performance. |
+| `souffle/mcfa_tuned.dl` | **Experiment:** the Soufflé program tuned with per-version `.plan` directives and an internally-flattened store (148× on church(80)). |
 | `tests/cross_check.rs` | Runs Ascent and Soufflé on the same input and asserts the outputs agree. |
 | `tests/generic_check.rs` | Checks generic `m=1` ≡ the faithful port, reproduces the polyvariance/padding phenomena, and checks parallel ≡ sequential. |
 | `tests/aam_check.rs` | Checks the hand-written AAM computes bit-for-bit the same relations as the Datalog, at `m ∈ {0,1,2}`. |
@@ -234,15 +235,15 @@ Machine directly in Rust: a global value store and continuation store
 (all sizes and `flow_ee` content, at `m ∈ {0,1,2}`).
 
 Comparing all engines at `m = 1` (single thread; Soufflé is the compiled
-`.printsize` binary; "ascent!" is the faithful item-macro port, "tuned" is the
-same program with delta-friendly rules — see below; "generic" is the
-`ascent_run!` version with a length-`m` vector context):
+`.printsize` binary; "tuned" versions apply the delta-friendly rewrites
+described below — same fixpoint, verified; "generic" is the `ascent_run!`
+version with a length-`m` vector context):
 
-| term | Soufflé | ascent! | **ascent tuned** | ascent generic | **AAM (raw Rust)** |
-|------|---------|---------|------------------|----------------|--------------------|
-| worst-case `N=12 K=3 P=0` | 2.05 s | 1.92 s | 1.78 s | 4.0 s | 2.82 s |
-| church(60) | 8.95 s | 1.17 s | **0.091 s** | 1.87 s | **0.045 s** |
-| church(80) | 28.3 s | 3.21 s | **0.155 s** | 5.33 s | **0.082 s** |
+| term | Soufflé | **Soufflé tuned** | ascent! | **ascent tuned** | ascent generic | **AAM (raw Rust)** |
+|------|---------|-------------------|---------|------------------|----------------|--------------------|
+| worst-case `N=12 K=3 P=0` | 1.93 s | **0.88 s** | 1.92 s | 1.78 s | 4.0 s | 2.82 s |
+| church(60) | 9.08 s | **0.109 s** | 1.17 s | **0.091 s** | 1.87 s | **0.045 s** |
+| church(80) | 27.0 s | **0.182 s** | 3.21 s | **0.155 s** | 5.33 s | **0.082 s** |
 
 Two very different regimes:
 
@@ -305,12 +306,55 @@ term. The residual ~2× vs the AAM is the irreducible rounds-based dispatch:
 ~25k rounds × ~55 rule variants, versus the worklist's 64k events each
 processed once.
 
+### Tuning Soufflé the same way: `.plan` + a flattened store
+
+For a fair comparison, `souffle/mcfa_tuned.dl` applies the equivalent tuning to
+the original Soufflé program. Soufflé's `.plan` directive is actually the
+sharper tool here: it schedules each semi-naive *version* of a rule separately
+(version *k* = delta on the *k*-th recursive body atom), so a 3-atom rule can
+be delta-first in **every** version — something static atom reordering cannot
+achieve, and what the Ascent tuning needed intermediate relations for. Two
+mechanical accommodations: `.plan` is rejected on non-recursive clauses and
+Soufflé clones multi-head rules per head, so the (non-recursive) `flow_*` heads
+are split into separate unplanned rules; and the A-IfT disjunction is expanded
+so plans can attach.
+
+`.plan` alone: church(80) 27.0 s → 6.3 s (4.3×). Profiling the rest
+(`souffle -p` + `souffleprof -c "rul <id>"`, which reports per-*version* time)
+found the residue concentrated in the store rules, and the generated RAM
+(`--show=transformed-ram`) shows why:
+
+```text
+FOR t0 IN @delta_state_e
+ FOR t1 IN var ON INDEX t1.0 = t0.0
+  FOR t2 IN stored_val              ← full scan, no index
+   ... UNPACK t2.0 ... IF (t1.1 = t4.0 AND t0.1 = t4.1)
+```
+
+**Soufflé cannot drive an index probe from a freshly-constructed record key**:
+`stored_val($VAddress(x, ctx), v)` with `x, ctx` bound and `v` free compiles to
+scan-all + unpack + filter (records/ADTs are interned ids, and only *fully
+bound* record values participate in index lookups). This is the strongest
+evidence yet for the earlier hypothesis about why the paper keeps syntax in
+flat relations: an ADT/record key is fine to *carry* (O(1) interned) and fine
+to match when bound, but as a *lookup key with free companion columns* it
+degrades to a scan. Flattening the store into columns internally
+(`stored_val_f(x, ctx, v)`, with `stored_val` reconstructed once for output —
+exactly what the Ascent tuning did) fixes it:
+
+| church(80), `-j1` | time |
+|---|---|
+| Soufflé (appendix rules) | 27.0 s |
+| + `.plan` on every recursive rule | 6.3 s |
+| + flattened store | **0.182 s** (148×) |
+
 The takeaway: the AAM's advantage was never "Rust vs Datalog" — it is that a
 worklist is *frontier-driven by construction*, while semi-naive evaluation is
-only frontier-driven if every rule variant can be joined starting from its
-delta. Written with that in mind, the declarative Ascent program lands within
-~2× of the hand-written machine (and remains parallelizable and 180× faster
-than compiled Soufflé on this benchmark).
+only frontier-driven if every rule version can start its join from its delta
+(and every probe along the way is indexable). Written with that discipline,
+*both* Datalog engines land within ~2× of the hand-written machine on the deep
+Church term — and tuned Soufflé is actually the fastest engine on the wide
+worst-case term.
 
 ## Performance: Ascent vs Soufflé, and thread scaling
 
