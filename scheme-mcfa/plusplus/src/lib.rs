@@ -14,4 +14,5 @@
 //! reuse its AST / term generators / baseline analyses.
 
 pub mod delta_flat;
+pub mod incremental;
 pub mod slog_style;
