@@ -17,5 +17,5 @@
 
 include "mcfa.slog"
 
-facts
+rule
 (top (callcc 1 (lam 2 ["k"] (prim 3 "+" (cnum 4 1) (cnum 5 2)))))

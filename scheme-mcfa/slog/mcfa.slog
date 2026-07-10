@@ -33,10 +33,13 @@
 ;;    `!lambda_arg_list(...)` becomes a positive `(lmem params x) < 1` test,
 ;;    since Slog has no stratified negation.
 ;;  * Multi-argument application/`lambda` and multi-binding `let` iterate
-;;    Slog lists.  The continuation `k_fn` carries the *parameter name* being
-;;    bound (obtained by zipping the argument list against the callee's
-;;    parameter list at the A-Ar step) instead of the paper's integer
-;;    position -- equivalent, and avoids positional list indexing.
+;;    Slog lists.  The continuation `k_fn` carries the paper's integer
+;;    argument POSITION; positional access to the argument/parameter lists
+;;    is provided by the demand-moded `expr_at`/`param_at` helpers below.
+;;    (An earlier draft zipped arguments against the callee's parameter
+;;    names at the A-Ar step instead -- NOT equivalent: the paper evaluates
+;;    every argument under ANY operator value, including non-closures,
+;;    arity-mismatched calls, and all arguments of an applied continuation.)
 
 ;; ---------------------------------------------------------------------
 ;; Syntax  (a recursive structured value; cf. `structured::Expr` + `Node`)
@@ -76,7 +79,7 @@ union (value
 union (kont
        (mt)                                       ;; halt
        (k_arg  (list expr) context context addrk) ;; args, ctx, ectx, next
-       (k_fn   value str context addrk)           ;; func, param-name, ectx, next
+       (k_fn   value int context addrk)           ;; func, arg-position, ectx, next
        (k_set  addrv addrk)                        ;; loc, next
        (k_if   expr expr context addrk)            ;; then, else, ctx, next
        (k_cc   context addrk)                       ;; ectx, next
@@ -110,24 +113,28 @@ table (result value)                    ;; a value reaching the empty (halt) con
 ;; ---------------------------------------------------------------------
 ;; each element of an expression list
 demand (expr_in (list expr)) expr
-facts (expr_in [a as ...] a)
+rule  (expr_in [a as ...] a)
 rule  (expr_in [a as ...] b) <-- (expr_in as b)
 
 ;; each binding of a `let`
 demand (bind_in (list binding)) binding
-facts (bind_in [b bs ...] b)
+rule  (bind_in [b bs ...] b)
 rule  (bind_in [b bs ...] c) <-- (bind_in bs c)
 
 ;; the list of names bound by a `let`
 demand (bind_names (list binding)) (list str)
-facts (bind_names [] [])
+rule  (bind_names [] [])
 rule  (bind_names [(bnd nm rhs) bs ...] [nm ns ...]) <-- (bind_names bs ns)
 
-;; zip an argument-expression list against a parameter-name list, yielding
-;; the aligned (arg, param) pairs (shorter list wins)
-demand (zip2 (list expr) (list str)) expr str
-facts (zip2 [a as ...] [p ps ...] a p)
-rule  (zip2 [a as ...] [p ps ...] ea pe) <-- (zip2 as ps ea pe)
+;; each (position, element) of an expression list
+demand (expr_at (list expr)) int expr
+rule  (expr_at [a as ...] 0 a)
+rule  (expr_at [a as ...] j b) <-- (expr_at as i b) (= j (+ i 1))
+
+;; each (position, name) of a parameter list
+demand (param_at (list str)) int str
+rule  (param_at [p ps ...] 0 p)
+rule  (param_at [p ps ...] j q) <-- (param_at ps i q) (= j (+ i 1))
 
 ;; ---------------------------------------------------------------------
 ;; Free variables  (the paper's `freevar`, computed structurally and
@@ -282,39 +289,34 @@ rule (state_a (v_clo elam ctx_clo) ak)
 rule (state_a (v_kont bk) ak) (stored_kont ak (k_cc _ _))
  --> (state_a (v_kont ak) bk) (flow_aa (v_kont bk) (v_kont ak))
 
-;; A-Ar (closure operator): the operator value has arrived; zip each argument
-;; against the callee's parameters and evaluate it under a `k_fn` cont tagged
-;; with the parameter name.
+;; A-Ar: the operator value has arrived; evaluate EVERY argument under a
+;; `k_fn` cont carrying the operator value and the argument's position.
+;; Faithful to the paper: this fires for ANY operator value (a non-applicable
+;; operator's arguments are still evaluated -- only A-Call filters), and for
+;; every argument position, even beyond the callee's arity.
 rule (state_a v ak)
-     v = (v_clo elam ctx_clo)
-     elam = (lam _ params ebody)
      (stored_kont ak (k_arg eargs ctx ectx nak))
-     (zip2 eargs params earg x)
+     (expr_at eargs pos earg)
  --> (state_e earg ctx (kaddr earg ctx))
-     (stored_kont (kaddr earg ctx) (k_fn v x ectx nak))
+     (stored_kont (kaddr earg ctx) (k_fn v pos ectx nak))
      (flow_ae v earg)
 
-;; A-Ar (continuation operator): a captured continuation is applied; it takes
-;; exactly one argument (the head), which we evaluate under a `k_fn` cont.
+;; A-Call (closure): an argument value has arrived; bind the parameter at the
+;; argument's position in the callee context and evaluate the body.  (The
+;; `param_at` join is also the arity filter: a position past the parameter
+;; list produces no state, exactly as the paper's positional indexing does.)
 rule (state_a v ak)
-     v = (v_kont _)
-     (stored_kont ak (k_arg [earg rest ...] ctx ectx nak))
- --> (state_e earg ctx (kaddr earg ctx))
-     (stored_kont (kaddr earg ctx) (k_fn v "" ectx nak))
-     (flow_ae v earg)
-
-;; A-Call (closure): an argument value has arrived; bind the parameter in the
-;; callee context and evaluate the body.
-rule (state_a v ak)
-     (stored_kont ak (k_fn (v_clo elam ctx_clo) x ectx nak))
+     (stored_kont ak (k_fn (v_clo elam ctx_clo) pos ectx nak))
      elam = (lam _ params ebody)
+     (param_at params pos x)
  --> (state_e ebody ectx nak)
      (stored_val (vaddr x ectx) v)
      (copy_ctx ctx_clo ectx elam)
      (flow_ae v ebody)
 
-;; A-Call (continuation as operator): deliver the argument to the continuation
-rule (state_a v ak) (stored_kont ak (k_fn (v_kont callcc_kont) _ _ _))
+;; A-Call (continuation as operator): deliver the FIRST argument's value to
+;; the continuation (per the paper, which matches position 0 only)
+rule (state_a v ak) (stored_kont ak (k_fn (v_kont callcc_kont) 0 _ _))
  --> (state_a v callcc_kont) (flow_aa v v)
 
 ;; A-Let: the bound RHS value has arrived; store it and run the body

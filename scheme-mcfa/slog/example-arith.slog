@@ -19,7 +19,7 @@
 
 include "mcfa.slog"
 
-facts
+rule
 (top
  (let_e 1
    [ (bnd "add" (lam 2 ["a" "b"] (prim 3 "+" (ref 4 "a") (ref 5 "b"))))

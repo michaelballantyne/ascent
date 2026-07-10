@@ -13,5 +13,5 @@
 
 include "mcfa.slog"
 
-facts
+rule
 (top (app 1 (lam 2 ["x"] (set_e 3 "x" (cnum 4 5))) [ (cnum 5 0) ]))
