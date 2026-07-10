@@ -35,11 +35,13 @@ use ascent::ascent;
 pub mod ast;
 pub mod edb;
 pub mod generic;
+pub mod parallel;
 pub mod structured;
 
-pub use ast::{Ast, Sym, feature_term, worst_case_term};
+pub use ast::{Ast, Sym, church_term, feature_term, worst_case_term, worst_case_term_single};
 pub use edb::Facts;
 pub use generic::{GenericStats, analyze_generic};
+pub use parallel::analyze_generic_par;
 pub use structured::{StructuredStats, analyze_structured, to_expr};
 
 /// `context = Context{ctx0:id}` — a length-1 contour of expression ids.

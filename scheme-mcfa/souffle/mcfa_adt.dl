@@ -1,0 +1,247 @@
+// Soufflé ADT-syntax variant of the m-CFA analysis.
+//
+// This is the experiment requested to test the hypothesis that the appendix
+// flattens *syntax* into id-relations because Soufflé handles ADTs poorly as
+// join/index keys. Here syntax is instead an `expr` ADT (like the value/kont
+// ADTs), and the analysis relations carry `expr` values in their keys.
+//
+// To keep the input identical to the flat program, we read the SAME flat
+// `.facts` and *build* the `expr` ADT inside Soufflé (`expr_of`); only the
+// analysis representation changes. Compare its running time against `mcfa.dl`
+// on the same input to see the regression.
+//
+// Restricted to single-argument lambdas/applications and single-binding lets
+// (a fixed-arity ADT with no list encoding), so run it on facts produced from
+// `worst_case_term_single` via `mcfa emit-souffle-single`.
+
+.type id <: symbol
+
+.type expr = EVar   { x: symbol }
+           | ENum   { n: number }
+           | EBool  { b: symbol }
+           | ELam   { param: symbol, body: expr }
+           | EApp   { func: expr, arg: expr }
+           | EIf    { g: expr, t: expr, f: expr }
+           | ELet   { x: symbol, e: expr, body: expr }
+           | ESet   { x: symbol, e: expr }
+           | ECallcc{ e: expr }
+           | EPrim  { op: symbol, e0: expr, e1: expr }
+
+.type context = MtCtx {} | Ctx1 { c: expr }
+.type address_k = KAddress { e: expr, ctx: context }
+.type address_v = VAddress { x: symbol, ctx: context }
+.type value = Number  { n: number }
+            | Bool     { b: symbol }
+            | Kont     { k: address_k }
+            | Closure  { e: expr, ctx: context }
+            | PrimVal  { op: symbol, v1: value, v2: value }
+.type kont = MT {}
+           | Arg     { arg: expr, ctx: context, ectx: context, next_ak: address_k }
+           | Fn      { fn: value, ctx: context, next_ak: address_k }
+           | Set     { loc: address_v, next_ak: address_k }
+           | If      { true_branch: expr, false_branch: expr, ctx: context, next_ak: address_k }
+           | Callcc  { ectx: context, next_ak: address_k }
+           | Let     { av: address_v, ebody: expr, ctx: context, next_ak: address_k }
+           | Prim1   { op: symbol, e2: expr, ctx: context, next_ak: address_k }
+           | Prim2   { op: symbol, v1: value, next_ak: address_k }
+
+// ---- flat input, identical to mcfa.dl ----
+.decl lambda(Id: id, Vars: id, BodyId: id)
+.input lambda
+.decl lambda_arg_list(Id: id, Pos: number, X: symbol)
+.input lambda_arg_list
+.decl prim_call(Id: id, PrimId: id, Args: id)
+.input prim_call
+.decl call(Id: id, FuncId: id, Args: id)
+.input call
+.decl call_arg_list(Id: id, Pos: number, X: id)
+.input call_arg_list
+.decl var(Id: id, MetaName: symbol)
+.input var
+.decl num(Id: id, v: number)
+.input num
+.decl bool(Id: id, v: symbol)
+.input bool
+.decl if(Id:id, GuardId: id, TrueId: id, False: id)
+.input if
+.decl setb(Id: id, Var: symbol, ExprId: id)
+.input setb
+.decl callcc(Id: id, ExprId: id)
+.input callcc
+.decl let(Id: id, BindId: id, BodyId: id)
+.input let
+.decl let_list(Id: id, X: symbol, EId: id)
+.input let_list
+.decl top_exp(Id: id)
+.input top_exp
+
+// ---- build the syntax ADT from the flat facts (single-arg / single-binding) ----
+.decl expr_of(id: id, e: expr)
+expr_of(id, $EVar(x)) :- var(id, x).
+expr_of(id, $ENum(n)) :- num(id, n).
+expr_of(id, $EBool(b)) :- bool(id, b).
+expr_of(id, $ELam(p, be)) :-
+    lambda(id, params, body), lambda_arg_list(params, 0, p), expr_of(body, be).
+expr_of(id, $EApp(fe, ae)) :-
+    call(id, func, args), call_arg_list(args, 0, arg), expr_of(func, fe), expr_of(arg, ae).
+expr_of(id, $EIf(ge, te, fe)) :-
+    if(id, g, t, f), expr_of(g, ge), expr_of(t, te), expr_of(f, fe).
+expr_of(id, $ELet(x, ee, be)) :-
+    let(id, ll, body), let_list(ll, x, e), expr_of(e, ee), expr_of(body, be).
+expr_of(id, $ESet(x, ee)) :- setb(id, x, e), expr_of(e, ee).
+expr_of(id, $ECallcc(ee)) :- callcc(id, e), expr_of(e, ee).
+expr_of(id, $EPrim(op, e0e, e1e)) :-
+    prim_call(id, op, pl), call_arg_list(pl, 0, e0), call_arg_list(pl, 1, e1),
+    expr_of(e0, e0e), expr_of(e1, e1e).
+
+.decl subexpr(e: expr)
+subexpr(e) :- expr_of(_, e).
+
+// ---- free variables over the ADT ----
+.decl freevar(x: symbol, e: expr)
+freevar(x, e) :- subexpr(e), e = $EVar(x).
+freevar(x, e) :- subexpr(e), e = $ELam(p, body), freevar(x, body), x != p.
+freevar(x, e) :- subexpr(e), e = $EApp(fe, ae), (freevar(x, fe) ; freevar(x, ae)).
+freevar(x, e) :- subexpr(e), e = $EPrim(_op, e0, e1), (freevar(x, e0) ; freevar(x, e1)).
+freevar(x, e) :- subexpr(e), e = $EIf(g, t, f), (freevar(x, g) ; freevar(x, t) ; freevar(x, f)).
+freevar(x, e) :- subexpr(e), e = $ESet(_sx, ev), freevar(x, ev).
+freevar(x, e) :- subexpr(e), e = $ECallcc(ev), freevar(x, ev).
+freevar(x, e) :- subexpr(e), e = $ELet(y, ee, body), freevar(x, ee), x != y.
+freevar(x, e) :- subexpr(e), e = $ELet(_lx, _le, body), freevar(x, body).
+
+// ---- analysis (keys carry `expr` ADTs) ----
+.decl state_e(e: expr, ctx: context, ak: address_k)
+.printsize state_e
+.decl state_a(v: value, ak: address_k)
+.printsize state_a
+.decl stored_val(av: address_v, v: value)
+.printsize stored_val
+.decl stored_kont(ak: address_k, k: kont)
+.printsize stored_kont
+.decl flow_ee(e1: expr, e2: expr)
+.printsize flow_ee
+.decl flow_ae(a1: value, e2: expr)
+.printsize flow_ae
+.decl flow_aa(a1: value, a2: value)
+.printsize flow_aa
+.decl peek_ctx(e: expr, ctx_old: context, ctx_new: context)
+.printsize peek_ctx
+.decl copy_ctx(from: context, to: context, e: expr)
+.printsize copy_ctx
+
+state_e(e, $MtCtx(), $KAddress(e, $MtCtx())),
+peek_ctx(e, $MtCtx(), $Ctx1(e)),
+stored_kont($KAddress(e, $MtCtx()), $MT()) :-
+    top_exp(id), expr_of(id, e).
+
+peek_ctx(e, old, $Ctx1(e)) :-
+    state_e(e, old, _),
+    ( e = $ECallcc(_cc) ; e = $EApp(_af, _aa) ; e = $ELet(_lx, _le, _lb) ; e = $ELam(_lp, _lb) ).
+
+stored_val($VAddress(fv, to), v) :-
+    copy_ctx(from, to, e),
+    freevar(fv, e),
+    stored_val($VAddress(fv, from), v).
+
+state_e(eg, ctx, $KAddress(eg, ctx)),
+stored_kont($KAddress(eg, ctx), $If(et, ef, ctx, ak)),
+flow_ee(e, eg) :-
+    state_e(e, ctx, ak), e = $EIf(eg, et, ef).
+
+state_e(elam, ctx, $KAddress(elam, ctx)),
+stored_kont($KAddress(elam, ctx), $Callcc(ectx, ak)),
+flow_ee(e, elam) :-
+    state_e(e, ctx, ak), e = $ECallcc(elam), peek_ctx(e, ctx, ectx).
+
+state_e(esub, ctx, $KAddress(esub, ctx)),
+stored_kont($KAddress(esub, ctx), $Set($VAddress(x, ctx), ak)),
+flow_ee(e, esub) :-
+    state_e(e, ctx, ak), e = $ESet(x, esub).
+
+state_e(efunc, ctx, $KAddress(efunc, ctx)),
+stored_kont($KAddress(efunc, ctx), $Arg(earg, ctx, ectx, ak)),
+flow_ee(e, efunc) :-
+    state_e(e, ctx, ak), e = $EApp(efunc, earg), peek_ctx(e, ctx, ectx).
+
+state_e(ebnd, ctx, $KAddress(ebnd, ctx)),
+stored_kont($KAddress(ebnd, ctx), $Let($VAddress(x, ectx), ebody, ectx, ak)),
+copy_ctx(ctx, ectx, e),
+flow_ee(e, ebnd) :-
+    state_e(e, ctx, ak), e = $ELet(x, ebnd, ebody), peek_ctx(e, ctx, ectx).
+
+state_e(e0, ctx, $KAddress(e0, ctx)),
+stored_kont($KAddress(e0, ctx), $Prim1(op, e1, ctx, ak)),
+flow_ee(e, e0) :-
+    state_e(e, ctx, ak), e = $EPrim(op, e0, e1).
+
+state_a($Number(n), ak) :- state_e(e, _, ak), e = $ENum(n).
+state_a($Bool(b), ak)   :- state_e(e, _, ak), e = $EBool(b).
+state_a($Closure(e, ctx), ak) :- state_e(e, ctx, ak), e = $ELam(_lp, _lb).
+state_a(v, ak) :-
+    state_e(e, ctx, ak), e = $EVar(x), stored_val($VAddress(x, ctx), v).
+
+state_e(et, ctx_k, next_ak),
+flow_ae($Bool("#t"), et) :-
+    ( state_a($Bool("#t"), ak) ; state_a($Closure(_ce, _cc), ak)
+    ; state_a($Number(_nn), ak) ; state_a($Kont(_kk), ak) ),
+    stored_kont(ak, $If(et, _ef, ctx_k, next_ak)).
+
+state_e(ef, ctx_k, next_ak),
+flow_ae($Bool("#f"), ef) :-
+    state_a($Bool("#f"), ak),
+    stored_kont(ak, $If(_et, ef, ctx_k, next_ak)).
+
+state_e(ebody, ectx, next_ak),
+stored_val($VAddress(x, ectx), $Kont(ak)),
+copy_ctx(ctx_clo, ectx, elam),
+flow_ae($Closure(elam, ctx_clo), ebody) :-
+    state_a($Closure(elam, ctx_clo), ak),
+    stored_kont(ak, $Callcc(ectx, next_ak)),
+    elam = $ELam(x, ebody).
+
+state_a($Kont(ak), bk),
+flow_aa($Kont(bk), $Kont(ak)) :-
+    state_a($Kont(bk), ak),
+    stored_kont(ak, $Callcc(_cx, _cnk)).
+
+state_e(earg, ctx, $KAddress(earg, ctx)),
+stored_kont($KAddress(earg, ctx), $Fn(v, ectx, next_ak)),
+flow_ae(v, earg) :-
+    state_a(v, ak),
+    stored_kont(ak, $Arg(earg, ctx, ectx, next_ak)).
+
+state_e(ebody, ectx, next_ak),
+stored_val($VAddress(x, ectx), v),
+copy_ctx(ctx_clo, ectx, elam),
+flow_ae(v, ebody) :-
+    state_a(v, ak),
+    stored_kont(ak, $Fn($Closure(elam, ctx_clo), ectx, next_ak)),
+    elam = $ELam(x, ebody).
+
+state_a(v, callcc_kont),
+flow_aa(v, v) :-
+    state_a(v, ak),
+    stored_kont(ak, $Fn($Kont(callcc_kont), _fcx, _fnk)).
+
+state_e(ebody, ctx, next_ak),
+stored_val(av, v),
+flow_ae(v, ebody) :-
+    state_a(v, ak),
+    stored_kont(ak, $Let(av, ebody, ctx, next_ak)).
+
+state_e(earg1, ctx, $KAddress(earg1, ctx)),
+stored_kont($KAddress(earg1, ctx), $Prim2(op, v, next_ak)),
+flow_ae(v, earg1) :-
+    state_a(v, ak),
+    stored_kont(ak, $Prim1(op, earg1, ctx, next_ak)).
+
+state_a($PrimVal(op, v1, v2), next_ak),
+flow_aa(v2, $PrimVal(op, v1, v2)) :-
+    state_a(v2, ak),
+    stored_kont(ak, $Prim2(op, v1, next_ak)).
+
+state_a($Number(-42), next_ak),
+stored_val(loc, v),
+flow_aa(v, $Number(-42)) :-
+    state_a(v, ak),
+    stored_kont(ak, $Set(loc, next_ak)).

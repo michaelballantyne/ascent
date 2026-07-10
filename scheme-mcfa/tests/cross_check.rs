@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use scheme_mcfa::{AddrK, Ast, Ctx, Facts, feature_term, worst_case_term};
+use scheme_mcfa::{AddrK, Ast, Ctx, Facts, church_term, feature_term, worst_case_term};
 
 fn souffle_bin() -> String { std::env::var("SOUFFLE").unwrap_or_else(|_| "souffle".to_string()) }
 
@@ -115,4 +115,5 @@ fn ascent_matches_souffle() {
    cross_check("worst_4_2_1", &worst_case_term(4, 2, 1));
    cross_check("worst_6_3_1", &worst_case_term(6, 3, 1));
    cross_check("worst_8_2_0", &worst_case_term(8, 2, 0));
+   cross_check("church_6", &church_term(6));
 }

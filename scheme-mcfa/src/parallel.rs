@@ -1,124 +1,36 @@
-//! **Variation: tunable polyvariance `m` (0/1/2/...-CFA).**
+//! Parallel version of the (generic-`m`) analysis, using `ascent_run_par!`.
 //!
-//! The paper's Appendix A hard-codes `context = Context{ctx0:id}`, i.e. a
-//! length-1 contour (`m=1`). To reproduce the paper's headline experiment —
-//! sweeping `m ∈ {0,1,2}` (Table 1) — this module generalizes the context to a
-//! bounded list of the most-recent `m` binding-site expressions.
-//!
-//! Every rule is identical to the faithful port in [`crate`]; the *only*
-//! semantic change is how a new context is formed:
-//!
-//! * empty context is now the empty list `[]` (rather than `Context("")`), and
-//! * `peek_ctx` extends the contour with [`extend_ctx`] instead of always
-//!   replacing it with the current expression.
-//!
-//! Because `m` is a runtime value we use [`ascent::ascent_run`] (which captures
-//! local variables) rather than the `ascent!` item macro.
+//! Identical rules to [`crate::generic`]; only the macro differs. Parallelism
+//! is controlled by Rayon (e.g. the `RAYON_NUM_THREADS` environment variable),
+//! letting us measure thread scaling and compare against Soufflé's `-j`.
 
-use std::sync::Arc;
-
-use ascent::ascent_run;
+use ascent::ascent_run_par;
 
 use crate::Facts;
 use crate::ast::Sym;
+use crate::generic::{GAddrK, GAddrV, GCtx, GKont, GValue, GenericStats, extend_ctx, gif_true};
 
-/// `context` — the most-recent (up to) `m` binding-site expression ids, newest
-/// first.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct GCtx(pub Vec<Sym>);
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct GAddrK { pub e: Sym, pub ctx: GCtx }
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct GAddrV { pub x: Sym, pub ctx: GCtx }
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum GValue {
-   Number(i64),
-   Bool(Sym),
-   Kont(GAddrK),
-   Closure { e: Sym, ctx: GCtx },
-   PrimVal { op: Sym, v1: Box<GValue>, v2: Box<GValue> },
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum GKont {
-   MT,
-   Arg { args: Sym, ctx: GCtx, ectx: GCtx, next_ak: GAddrK },
-   Fn { func: GValue, pos: i64, ctx: GCtx, next_ak: GAddrK },
-   Set { loc: GAddrV, next_ak: GAddrK },
-   If { true_branch: Sym, false_branch: Sym, ctx: GCtx, next_ak: GAddrK },
-   Callcc { ectx: GCtx, next_ak: GAddrK },
-   Let { av: GAddrV, ebody: Sym, ctx: GCtx, next_ak: GAddrK },
-   Prim1 { op: Sym, e2: Sym, ctx: GCtx, next_ak: GAddrK },
-   Prim2 { op: Sym, v1: GValue, next_ak: GAddrK },
-}
-
-/// `new`/`⌊·⌋ₘ`: push binding site `e` onto the contour, keeping only the
-/// newest `m` entries. `m=0` yields the (context-insensitive) empty contour.
-pub(crate) fn extend_ctx(e: &Sym, old: &GCtx, m: usize) -> GCtx {
-   if m == 0 {
-      return GCtx(Vec::new());
-   }
-   let mut v = Vec::with_capacity(m);
-   v.push(e.clone());
-   v.extend(old.0.iter().take(m - 1).cloned());
-   GCtx(v)
-}
-
-pub(crate) fn gif_true(v: &GValue) -> bool {
-   matches!(v, GValue::Closure { .. } | GValue::Number(_) | GValue::Kont(_))
-      || matches!(v, GValue::Bool(b) if b.as_ref() == "#t")
-}
-
-/// Result of a generic `m`-CFA run: the sizes of every relation.
-#[derive(Clone, Debug, Default)]
-pub struct GenericStats {
-   pub m: usize,
-   pub state_e: usize,
-   pub state_a: usize,
-   pub stored_val: usize,
-   pub stored_kont: usize,
-   pub flow_ee: usize,
-   pub flow_ea: usize,
-   pub flow_ae: usize,
-   pub flow_aa: usize,
-   pub freevar: usize,
-   pub peek_ctx: usize,
-   pub copy_ctx: usize,
-   /// `flow_ee` edges, for cross-checking against the faithful `m=1` port.
-   pub flow_ee_edges: Vec<(Sym, Sym)>,
-}
-
-impl GenericStats {
-   pub fn total_derived(&self) -> usize {
-      self.state_e + self.state_a + self.stored_val + self.stored_kont
-         + self.flow_ee + self.flow_ea + self.flow_ae + self.flow_aa
-   }
-}
-
-/// Run `m`-CFA on `facts` for an arbitrary polyvariance `m`.
-pub fn analyze_generic(facts: &Facts, m: usize) -> GenericStats {
+/// Run `m`-CFA in parallel. Set `RAYON_NUM_THREADS` to choose the thread count.
+pub fn analyze_generic_par(facts: &Facts, m: usize) -> GenericStats {
    let empty = GCtx(Vec::new());
 
-   let prog = ascent_run! {
-      relation top_exp(Sym) = facts.top_exp.clone();
-      relation lambda(Sym, Sym, Sym) = facts.lambda.clone();
-      relation lambda_arg_list(Sym, i64, Sym) = facts.lambda_arg_list.clone();
-      relation prim(Sym, Sym) = facts.prim.clone();
-      relation prim_call(Sym, Sym, Sym) = facts.prim_call.clone();
-      relation call(Sym, Sym, Sym) = facts.call.clone();
-      relation call_arg_list(Sym, i64, Sym) = facts.call_arg_list.clone();
-      relation var(Sym, Sym) = facts.var.clone();
-      relation num(Sym, i64) = facts.num.clone();
-      relation boolean(Sym, Sym) = facts.boolean.clone();
-      relation quotation(Sym, Sym) = facts.quotation.clone();
-      relation if_(Sym, Sym, Sym, Sym) = facts.if_.clone();
-      relation setb(Sym, Sym, Sym) = facts.setb.clone();
-      relation callcc(Sym, Sym) = facts.callcc.clone();
-      relation let_(Sym, Sym, Sym) = facts.let_.clone();
-      relation let_list(Sym, Sym, Sym) = facts.let_list.clone();
+   let prog = ascent_run_par! {
+      relation top_exp(Sym) = facts.top_exp.iter().cloned().collect();
+      relation lambda(Sym, Sym, Sym) = facts.lambda.iter().cloned().collect();
+      relation lambda_arg_list(Sym, i64, Sym) = facts.lambda_arg_list.iter().cloned().collect();
+      relation prim(Sym, Sym) = facts.prim.iter().cloned().collect();
+      relation prim_call(Sym, Sym, Sym) = facts.prim_call.iter().cloned().collect();
+      relation call(Sym, Sym, Sym) = facts.call.iter().cloned().collect();
+      relation call_arg_list(Sym, i64, Sym) = facts.call_arg_list.iter().cloned().collect();
+      relation var(Sym, Sym) = facts.var.iter().cloned().collect();
+      relation num(Sym, i64) = facts.num.iter().cloned().collect();
+      relation boolean(Sym, Sym) = facts.boolean.iter().cloned().collect();
+      relation quotation(Sym, Sym) = facts.quotation.iter().cloned().collect();
+      relation if_(Sym, Sym, Sym, Sym) = facts.if_.iter().cloned().collect();
+      relation setb(Sym, Sym, Sym) = facts.setb.iter().cloned().collect();
+      relation callcc(Sym, Sym) = facts.callcc.iter().cloned().collect();
+      relation let_(Sym, Sym, Sym) = facts.let_.iter().cloned().collect();
+      relation let_list(Sym, Sym, Sym) = facts.let_list.iter().cloned().collect();
 
       relation value_form(Sym);
       relation freevar(Sym, Sym);
@@ -152,13 +64,11 @@ pub fn analyze_generic(facts: &Facts, m: usize) -> GenericStats {
       freevar(x.clone(), e.clone()) <--
          let_list(e, _, bind), freevar(x, bind), !let_list(e, x, _);
 
-      // injection: empty contour []
       state_e(e.clone(), empty.clone(), GAddrK { e: e.clone(), ctx: empty.clone() }),
       peek_ctx(e.clone(), empty.clone(), extend_ctx(e, &empty, m)),
       stored_kont(GAddrK { e: e.clone(), ctx: empty.clone() }, GKont::MT) <--
          top_exp(e);
 
-      // peek_ctx: extend the contour by the current binding site (length-m)
       peek_ctx(e.clone(), old.clone(), extend_ctx(e, old, m)) <--
          state_e(e, old, _),
          (callcc(e, _) | call(e, _, _) | let_(e, _, _) | lambda(e, _, _));
@@ -223,12 +133,12 @@ pub fn analyze_generic(facts: &Facts, m: usize) -> GenericStats {
          state_e(e, ctx, ak), var(e, x), stored_val(GAddrV { x: x.clone(), ctx: ctx.clone() }, v);
 
       state_e(et.clone(), ctx_k.clone(), next_ak.clone()),
-      flow_ae(GValue::Bool(Arc::from("#t")), et.clone()) <--
+      flow_ae(GValue::Bool(std::sync::Arc::from("#t")), et.clone()) <--
          state_a(v, ak), if gif_true(v),
          stored_kont(ak, ?GKont::If { true_branch: et, ctx: ctx_k, next_ak, .. });
 
       state_e(ef.clone(), ctx_k.clone(), next_ak.clone()),
-      flow_ae(GValue::Bool(Arc::from("#f")), ef.clone()) <--
+      flow_ae(GValue::Bool(std::sync::Arc::from("#f")), ef.clone()) <--
          state_a(?GValue::Bool(b), ak), if b.as_ref() == "#f",
          stored_kont(ak, ?GKont::If { false_branch: ef, ctx: ctx_k, next_ak, .. });
 
@@ -306,6 +216,6 @@ pub fn analyze_generic(facts: &Facts, m: usize) -> GenericStats {
       freevar: prog.freevar.len(),
       peek_ctx: prog.peek_ctx.len(),
       copy_ctx: prog.copy_ctx.len(),
-      flow_ee_edges: prog.flow_ee,
+      flow_ee_edges: prog.flow_ee.iter().cloned().collect(),
    }
 }

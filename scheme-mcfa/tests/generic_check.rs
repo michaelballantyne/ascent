@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use scheme_mcfa::{Facts, analyze, analyze_generic, feature_term, worst_case_term};
+use scheme_mcfa::{Facts, analyze, analyze_generic, analyze_generic_par, feature_term, worst_case_term};
 
 /// The generic analysis at `m = 1` must produce exactly the same flow graph as
 /// the faithful, hard-coded `m = 1` port.
@@ -45,4 +45,19 @@ fn polyvariance_and_padding_phenomena() {
    let padded = Facts::from_ast(&worst_case_term(8, 2, 1));
    let m2_padded = analyze_generic(&padded, 2).total_derived();
    assert!(m2_padded > 5 * m2, "expected padded m=2 ({m2_padded}) to explode vs unpadded m=2 ({m2})");
+}
+
+/// The parallel backend (`ascent_run_par!`) computes exactly the same result as
+/// the sequential one.
+#[test]
+fn parallel_matches_sequential() {
+   for ast in [feature_term(), worst_case_term(6, 3, 1)] {
+      let facts = Facts::from_ast(&ast);
+      let seq = analyze_generic(&facts, 1);
+      let par = analyze_generic_par(&facts, 1);
+      assert_eq!(seq.total_derived(), par.total_derived());
+      let seq_edges: std::collections::BTreeSet<_> = seq.flow_ee_edges.into_iter().collect();
+      let par_edges: std::collections::BTreeSet<_> = par.flow_ee_edges.into_iter().collect();
+      assert_eq!(seq_edges, par_edges);
+   }
 }

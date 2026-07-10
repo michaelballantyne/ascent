@@ -37,8 +37,10 @@ This crate:
 | `src/edb.rs` | Lowering of the AST to input facts (`Facts`), and a Soufflé `.facts` writer. |
 | `src/generic.rs` | **Variation:** the same analysis generalized to a length-`m` contour, with `m` a runtime parameter (`analyze_generic`). |
 | `src/structured.rs` | **Variation:** syntax represented as a recursive `Expr` enum matched structurally in the rules, instead of flat id-relations (`analyze_structured`). |
-| `src/main.rs` | CLI runner / benchmark. |
+| `src/parallel.rs` | The generic analysis via `ascent_run_par!` (`analyze_generic_par`), for thread-scaling measurements. |
+| `src/main.rs` | CLI runner / benchmarks. |
 | `souffle/mcfa.dl` | The original Soufflé program, transcribed verbatim from Appendix A (only change: Soufflé 2.4.1 spells the nullary constructor `$MT()`). |
+| `souffle/mcfa_adt.dl` | **Experiment:** a Soufflé version that carries syntax as an `expr` ADT instead of flat relations, to test whether ADTs regress performance. |
 | `tests/cross_check.rs` | Runs Ascent and Soufflé on the same input and asserts the outputs agree. |
 | `tests/generic_check.rs` | Checks generic `m=1` ≡ the faithful port, and reproduces the polyvariance/padding phenomena. |
 | `tests/structured_check.rs` | Checks the structured variant against the flat one (identical on duplicate-free terms; conflating on repeated subterms). |
@@ -58,6 +60,12 @@ cargo run --release -p scheme-mcfa -- cfa 8 3 0
 
 # The structured-syntax variation vs. the flat one (same term, given m):
 cargo run --release -p scheme-mcfa -- structured 8 2 0 1
+
+# The "realistic" Church-arithmetic benchmark (sum of Church numerals 0..=N):
+cargo run --release -p scheme-mcfa -- church 60
+
+# Parallel run (thread count from RAYON_NUM_THREADS):
+RAYON_NUM_THREADS=4 cargo run --release -p scheme-mcfa -- church-par 80 1
 
 # Emit equivalent Soufflé .facts for a term:
 cargo run --release -p scheme-mcfa -- emit-souffle /tmp/facts 10 3 0
@@ -187,6 +195,103 @@ subterms), use a *labelled* AST: give each node a unique id and key its
 structure; nothing is conflated. That is the representation most hand-written
 CFA implementations use, and it is straightforward in Ascent — but impractical
 in Soufflé for the same ADT-indexing reason.
+
+## A realistic benchmark: Church arithmetic
+
+The worst-case family is adversarial by construction. `church_term(n)` is an
+ordinary functional program instead: it Church-encodes the naturals, builds
+`0..=n` with the Church successor, sums them with Church `plus`, and reads the
+result out. It is intensely higher-order — every number *is* a function and
+`succ`/`plus` are shared — which is exactly the setting CFA exists for.
+
+It also surfaces a real phenomenon. With an **arithmetic** read-out
+(`(lambda (y) (+ y 1))`), the analysis builds an unbounded tower of `PrimVal`s
+and blows up at *every* `m` (church(2) OOMs) — a faithful demonstration of why
+`k`-CFA is intractable on natural higher-order arithmetic (Shivers; Van Horn &
+Mairson). With an **identity** read-out the value domain stays finite, and the
+benchmark scales smoothly with `n` (the workload is then the closure flow):
+
+```text
+church(sum 0..=N), faithful m=1 (Ascent)
+  N=20   4844 derived    32 ms
+  N=40  17074 derived   276 ms
+  N=60  36904 derived   1.15 s
+  N=80  64334 derived   3.36 s
+```
+
+## Performance: Ascent vs Soufflé, and thread scaling
+
+Measured on a 4-core sandbox. "Soufflé" is the compiled program with
+`.printsize` (it computes the full fixpoint but serializes only relation
+sizes, matching Ascent's in-memory run — with full `.output` Soufflé is several
+times slower still). "Ascent seq" is the faithful `m=1` port. Both compute the
+identical fixpoint (verified by `cross_check`).
+
+**Single thread:**
+
+| term | Soufflé (`-j1`) | Ascent (seq) |
+|------|-----------------|--------------|
+| worst `N=10 K=3 P=0` | 0.71 s | 0.60 s |
+| worst `N=12 K=3 P=0` | 2.10 s | 1.59 s |
+| church(80) | 28.3 s | 3.4 s |
+
+Ascent is competitive on the synthetic term and markedly faster (~8×) on the
+Church benchmark.
+
+**Thread scaling (1 / 2 / 4 threads):**
+
+| | 1 | 2 | 4 |
+|--|--|--|--|
+| Soufflé, worst `N=12` (`-jN`) | 2.10 s | 2.10 s | 2.09 s |
+| Soufflé, church(80) (`-jN`) | 28.3 s | 28.3 s | 28.1 s |
+| Ascent `par`, worst `N=12` (`RAYON_NUM_THREADS`) | ~4.2 s | ~3.8 s | ~3.0 s |
+| Ascent `par`, church(80) | 37.7 s | 36.3 s | 30.4 s |
+
+* **Soufflé does not scale here** — the time is flat from 1 to 4 threads (the
+  paper reports outright *anti*-scaling on larger runs). The paper's own
+  explanation: their analysis "uses a large number of rules, and Soufflé does
+  not parallelize across rules" — it parallelizes tuple work *within* one rule,
+  so a program that is many small rules over modest relations has little to
+  exploit and pays thread overhead.
+* **Ascent's parallel backend scales positively but sublinearly** (~1.2–1.5× at
+  4 cores). Note the parallel runtime (`ascent_run_par!`, concurrent hash maps)
+  has a large constant overhead, and this measurement also uses the heavier
+  length-`m` vector context, so parallel Ascent is *slower in absolute terms*
+  than sequential Ascent for these workloads — the sequential port is the one
+  to beat. (`parallel_matches_sequential` checks the two agree.)
+
+## Does representing syntax as ADTs regress Soufflé?
+
+`souffle/mcfa_adt.dl` carries syntax as an `expr` ADT (built inside Soufflé from
+the *same* flat facts, so only the analysis representation differs). Comparing
+compiled, single-thread, on the same single-binding term:
+
+```text
+term (single-binding worst-case)   flat (id relations)   ADT (structured)
+  N=10 K=3                                 2.05 s               1.87 s  (0.91×)
+  N=12 K=3                                 6.09 s               5.62 s  (0.92×)
+```
+
+Perhaps surprisingly, the ADT version is **not** slower — marginally faster,
+because Soufflé **hash-conses** records/ADTs, so an `expr` used as an analysis
+key is an O(1) interned integer internally, just like an id (and structural
+sharing conflates duplicate subterms, so there are slightly fewer facts — the
+same effect as the Rust `structured` variant).
+
+So for *this* analysis the cost hypothesis doesn't hold; the real friction with
+ADT-syntax in Soufflé is **expressiveness/ergonomics**, not key cost:
+
+* Soufflé rejects wildcards inside an ADT branch match — `e = $EIf(g, _, _)`
+  fails with *"Ungrounded ADT branch"*; every field must be named
+  (`e = $EIf(g, _t, _f)`).
+* Variable-arity syntax (multi-argument lambdas, multi-binding `let`,
+  argument lists) has no natural fixed-arity ADT encoding, so `mcfa_adt.dl` is
+  restricted to single-argument / single-binding terms (`worst_case_term_single`);
+  the flat relations handle arbitrary arity directly. This is likely the
+  practical reason the appendix keeps *syntax* flat while using ADTs for values
+  and continuations.
+* You cannot build a join index on a field *nested inside* an ADT without first
+  destructuring it into a helper relation.
 
 ## Notes
 

@@ -25,11 +25,38 @@ fn main() {
          run_once(n, k, p, true);
       }
       "bench" => bench(),
+      "church" => {
+         let nn = arg(&args, 2, 8);
+         let facts = Facts::from_ast(&scheme_mcfa::church_term(nn));
+         let n_input = facts.len();
+         let mut prog = facts.into_program();
+         let start = Instant::now();
+         prog.run();
+         let elapsed = start.elapsed();
+         let derived = prog.state_e.len() + prog.state_a.len() + prog.stored_val.len()
+            + prog.stored_kont.len() + prog.flow_ee.len() + prog.flow_ea.len()
+            + prog.flow_ae.len() + prog.flow_aa.len();
+         println!("church(sum 0..={nn}) input={n_input} state_a={} stored_val={} derived={derived} time={:.3?}",
+            prog.state_a.len(), prog.stored_val.len(), elapsed);
+      }
       "cfa" => {
          let n = arg(&args, 2, 8);
          let k = arg(&args, 3, 2);
          let p = arg(&args, 4, 0);
          cfa_sweep(n, k, p);
+      }
+      "church-cfa" => {
+         let nn = arg(&args, 2, 2);
+         let minm = arg(&args, 3, 0);
+         let maxm = arg(&args, 4, 4);
+         let facts = Facts::from_ast(&scheme_mcfa::church_term(nn));
+         println!("church(sum 0..={nn}) polyvariance sweep ({} input facts)\n", facts.len());
+         println!("{:>3}  {:>12}  {:>12}", "m", "derived", "time");
+         for m in minm..=maxm {
+            let start = Instant::now();
+            let stats = scheme_mcfa::analyze_generic(&facts, m);
+            println!("{:>3}  {:>12}  {:>12.3?}", m, stats.total_derived(), start.elapsed());
+         }
       }
       "structured" => {
          let n = arg(&args, 2, 8);
@@ -38,15 +65,48 @@ fn main() {
          let m = arg(&args, 5, 1);
          structured_vs_flat(n, k, p, m);
       }
-      "emit-souffle" => {
+      "church-par" => {
+         // Parallel run on the Church benchmark; threads from RAYON_NUM_THREADS.
+         let nn = arg(&args, 2, 60);
+         let m = arg(&args, 3, 1);
+         let facts = Facts::from_ast(&scheme_mcfa::church_term(nn));
+         let start = Instant::now();
+         let stats = scheme_mcfa::analyze_generic_par(&facts, m);
+         let elapsed = start.elapsed();
+         let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "default".into());
+         println!("ascent_par church(0..={nn}) m={m} threads={threads}  derived={}  time={:.3?}",
+            stats.total_derived(), elapsed);
+      }
+      "par" => {
+         // Parallel run; thread count comes from RAYON_NUM_THREADS.
+         let n = arg(&args, 2, 12);
+         let k = arg(&args, 3, 3);
+         let p = arg(&args, 4, 0);
+         let m = arg(&args, 5, 1);
+         let facts = Facts::from_ast(&worst_case_term(n, k, p));
+         let start = Instant::now();
+         let stats = scheme_mcfa::analyze_generic_par(&facts, m);
+         let elapsed = start.elapsed();
+         let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "default".into());
+         println!("ascent_par N={n} K={k} P={p} m={m} threads={threads}  derived={}  time={:.3?}",
+            stats.total_derived(), elapsed);
+      }
+      "emit-souffle" | "emit-souffle-single" | "emit-souffle-church" => {
          let dir = args.get(2).cloned().unwrap_or_else(|| {
-            eprintln!("emit-souffle needs a target DIR");
+            eprintln!("{cmd} needs a target DIR");
             std::process::exit(1);
          });
          let n = arg(&args, 3, 20);
          let k = arg(&args, 4, 3);
          let p = arg(&args, 5, 0);
-         let facts = Facts::from_ast(&worst_case_term(n, k, p));
+         let ast = if cmd == "emit-souffle-single" {
+            scheme_mcfa::worst_case_term_single(n, k, p)
+         } else if cmd == "emit-souffle-church" {
+            scheme_mcfa::church_term(n)
+         } else {
+            worst_case_term(n, k, p)
+         };
+         let facts = Facts::from_ast(&ast);
          facts.write_souffle(Path::new(&dir)).expect("write souffle facts");
          println!("wrote {} input facts for term N={n} K={k} P={p} into {dir}", facts.len());
       }

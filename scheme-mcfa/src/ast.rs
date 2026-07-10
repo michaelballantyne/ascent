@@ -124,6 +124,96 @@ pub fn worst_case_term(n_calls: usize, k_plus: usize, padding: usize) -> Ast {
    Ast::app(Ast::lam(&["f"], let_expr), vec![f_lambda])
 }
 
+/// Like [`worst_case_term`] but using only single-argument lambdas,
+/// single-argument applications, and nested single-binding `let`s, so the term
+/// can be represented by a fixed-arity syntax ADT (no list encoding). Used by
+/// the Soufflé ADT-syntax experiment (`souffle/mcfa_adt.dl`), which needs a
+/// non-list ADT. The blow-up mechanism is the same as [`worst_case_term`].
+pub fn worst_case_term_single(n_calls: usize, k_plus: usize, padding: usize) -> Ast {
+   let n_calls = n_calls.max(1);
+   let k_plus = k_plus.max(1);
+
+   let inner = Ast::app(Ast::lam(&["x"], plus_chain(k_plus)), vec![identity()]);
+   let f_lambda = Ast::lam(&["z"], pad(inner, padding));
+
+   // nested single-binding lets: (let ((b0 (f 0))) (let ((b1 (f 1))) ... b0))
+   let mut body = Ast::var("b0");
+   for i in (0..n_calls).rev() {
+      let name = format!("b{i}");
+      body = Ast::let_(
+         vec![(name.as_str(), Ast::app(Ast::var("f"), vec![Ast::num(i as i64)]))],
+         body,
+      );
+   }
+   Ast::app(Ast::lam(&["f"], body), vec![f_lambda])
+}
+
+/// A "realistic" higher-order benchmark: Church-encoded natural-number
+/// arithmetic. Builds the numerals `0..=n` with the Church successor, sums them
+/// with Church `plus`, and reads the result out by applying it to `add1` and
+/// `0`. Unlike the adversarial worst-case family, this is an ordinary
+/// functional program — but it is intensely higher-order (every number is a
+/// function, and `succ`/`plus`/`add1` are shared, so many closures flow to the
+/// same call sites), which is exactly what makes CFA work.
+///
+/// ```scheme
+/// (let ((zero (lambda (f) (lambda (x) x)))
+///       (succ (lambda (n) (lambda (f) (lambda (x) (f ((n f) x))))))
+///       (plus (lambda (m) (lambda (n) (lambda (f) (lambda (x) ((m f) ((n f) x)))))))
+///       (idf  (lambda (y) y)))
+///   ((  (plus (... (plus n0 n1) ...) nN)  idf) base))
+/// ```
+///
+/// We read the numeral out by applying it to the *identity* function and a base
+/// value. Applying identity any number of times keeps the value bounded, so the
+/// abstract value domain stays finite and the analysis is tractable — the
+/// workload is the (still substantial) higher-order *closure* flow through the
+/// shared `succ`/`plus`/`idf` lambdas, which is what CFA is about.
+///
+/// (Using an arithmetic read-out such as `(lambda (y) (+ y 1))` instead makes
+/// the analysis build an unbounded tower of `PrimVal`s and blow up at every `m`
+/// — a faithful demonstration that `m`-CFA is intractable on natural
+/// higher-order arithmetic, but useless as a bounded benchmark.)
+pub fn church_term(n: usize) -> Ast {
+   let n = n.max(1);
+   let ap1 = |f: Ast, a: Ast| Ast::app(f, vec![a]); // curried single-arg application
+
+   let zero = Ast::lam(&["f"], Ast::lam(&["x"], Ast::var("x")));
+   let succ = Ast::lam(
+      &["n"],
+      Ast::lam(&["f"], Ast::lam(&["x"], ap1(Ast::var("f"), ap1(ap1(Ast::var("n"), Ast::var("f")), Ast::var("x"))))),
+   );
+   let plus = Ast::lam(
+      &["m"],
+      Ast::lam(
+         &["n"],
+         Ast::lam(
+            &["f"],
+            Ast::lam(&["x"], ap1(ap1(Ast::var("m"), Ast::var("f")), ap1(ap1(Ast::var("n"), Ast::var("f")), Ast::var("x")))),
+         ),
+      ),
+   );
+   let idf = Ast::lam(&["y"], Ast::var("y"));
+
+   // Church numerals 0..=n, each built with `succ`.
+   let mut nums = vec![Ast::var("zero")];
+   for _ in 1..=n {
+      let prev = nums.last().unwrap().clone();
+      nums.push(ap1(Ast::var("succ"), prev));
+   }
+
+   // Sum them all with `plus`.
+   let mut acc = nums[0].clone();
+   for num in nums.iter().skip(1) {
+      acc = ap1(ap1(Ast::var("plus"), acc), num.clone());
+   }
+
+   // Read out the resulting numeral: ((acc idf) 0).
+   let readout = ap1(ap1(acc, Ast::var("idf")), Ast::num(0));
+
+   Ast::let_(vec![("zero", zero), ("succ", succ), ("plus", plus), ("idf", idf)], readout)
+}
+
 /// A small term exercising every language feature (and hence every analysis
 /// rule family): `let`, `lambda`, `var`, `call`, `if`, `set!`, `call/cc`
 /// (both capturing and invoking the continuation), booleans, and a binary
