@@ -388,6 +388,16 @@ fn engines(ast: &scheme_mcfa::Ast, which: &str) {
    let st = analyze_structured_tuned(&top, 1);
    row("ascent (structured, tuned)", st.total_derived(), t.elapsed());
 
+   // Hybrid: Ascent for the both-sides-growing joins, Rust for the stepping.
+   let t = Instant::now();
+   let h = scheme_mcfa::analyze_structured_hybrid(&top, 1);
+   row("hybrid (ascent joins + Rust step)", h.total_derived(), t.elapsed());
+
+   // Hybrid, memoizing: the apply join enumerated once, outputs materialized.
+   let t = Instant::now();
+   let hm = scheme_mcfa::analyze_structured_hybrid_memo(&top, 1);
+   row("hybrid (memoized apply_out)", hm.total_derived(), t.elapsed());
+
    // Raw Rust: textbook step machine.
    let t = Instant::now();
    let a = analyze_aam(&top, 1);
