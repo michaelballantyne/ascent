@@ -1,0 +1,20 @@
+;; ---------------------------------------------------------------------
+;; Syntax  (a recursive structured value; cf. `structured::Expr` + `Node`)
+;; Every node's first field is a unique label (see mcfa.slog's header).
+;; Factored out so per-term "loader" programs (see slog/README.md /
+;; bench-slog.sh) can declare just the syntax types, without pulling in
+;; the whole analysis via `include`.
+;; ---------------------------------------------------------------------
+union (binding (bnd str expr))          ;; one `let` binding: name = rhs
+
+union (expr
+       (ref  int str)                   ;; variable reference
+       (cnum int int)                    ;; number literal
+       (cbool int str)                   ;; boolean literal, "#t" / "#f"
+       (lam  int (list str) expr)        ;; (lambda (x ...) body)
+       (app  int expr (list expr))       ;; (operator arg ...)
+       (if_e int expr expr expr)         ;; (if guard then else)
+       (let_e int (list binding) expr)   ;; (let ([x e] ...) body)
+       (set_e int str expr)              ;; (set! x e)
+       (callcc int expr)                 ;; (call/cc operand)
+       (prim int str expr expr))         ;; binary primitive (op a b)

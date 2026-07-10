@@ -10,3 +10,4 @@ ez3_tests/
 .z3-trace
 nll-facts/
 scheme-mcfa/slog/bench-out/
+scheme-mcfa/slog/bench-out-staged/
