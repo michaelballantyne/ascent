@@ -1,0 +1,166 @@
+//! CLI runner and basic benchmark for the Ascent `m`-CFA reproduction.
+//!
+//! Usage:
+//! ```text
+//! mcfa run   [N] [K] [P]        # run once on the worst-case term (N calls, K pluses, P padding)
+//! mcfa bench                    # sweep a few term sizes and print a timing table
+//! mcfa emit-souffle DIR [N K P] # write equivalent Soufflé .facts files into DIR
+//! ```
+
+use std::env;
+use std::path::Path;
+use std::time::Instant;
+
+use scheme_mcfa::{AddrK, Ctx, Facts, worst_case_term};
+
+fn main() {
+   let args: Vec<String> = env::args().collect();
+   let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("bench");
+
+   match cmd {
+      "run" => {
+         let n = arg(&args, 2, 10);
+         let k = arg(&args, 3, 3);
+         let p = arg(&args, 4, 0);
+         run_once(n, k, p, true);
+      }
+      "bench" => bench(),
+      "cfa" => {
+         let n = arg(&args, 2, 8);
+         let k = arg(&args, 3, 2);
+         let p = arg(&args, 4, 0);
+         cfa_sweep(n, k, p);
+      }
+      "emit-souffle" => {
+         let dir = args.get(2).cloned().unwrap_or_else(|| {
+            eprintln!("emit-souffle needs a target DIR");
+            std::process::exit(1);
+         });
+         let n = arg(&args, 3, 20);
+         let k = arg(&args, 4, 3);
+         let p = arg(&args, 5, 0);
+         let facts = Facts::from_ast(&worst_case_term(n, k, p));
+         facts.write_souffle(Path::new(&dir)).expect("write souffle facts");
+         println!("wrote {} input facts for term N={n} K={k} P={p} into {dir}", facts.len());
+      }
+      "dump" => {
+         let dir = args.get(2).cloned().unwrap_or_else(|| {
+            eprintln!("dump needs a target DIR");
+            std::process::exit(1);
+         });
+         let n = arg(&args, 3, 4);
+         let k = arg(&args, 4, 2);
+         let p = arg(&args, 5, 1);
+         dump(&dir, n, k, p);
+      }
+      other => {
+         eprintln!("unknown command: {other}");
+         eprintln!("usage: mcfa [run N K P | bench | emit-souffle DIR N K P | dump DIR N K P]");
+         std::process::exit(1);
+      }
+   }
+}
+
+fn arg(args: &[String], i: usize, default: usize) -> usize {
+   args.get(i).and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+fn run_once(n: usize, k: usize, p: usize, verbose: bool) {
+   let facts = Facts::from_ast(&worst_case_term(n, k, p));
+   let n_input = facts.len();
+   let mut prog = facts.into_program();
+
+   let start = Instant::now();
+   prog.run();
+   let elapsed = start.elapsed();
+
+   let derived = prog.state_e.len()
+      + prog.state_a.len()
+      + prog.stored_val.len()
+      + prog.stored_kont.len()
+      + prog.flow_ee.len()
+      + prog.flow_ea.len()
+      + prog.flow_ae.len()
+      + prog.flow_aa.len();
+
+   if verbose {
+      println!("term N={n} K={k} P={p}");
+      println!("  input facts:   {n_input}");
+      println!("  state_e:       {}", prog.state_e.len());
+      println!("  state_a:       {}", prog.state_a.len());
+      println!("  stored_val:    {}", prog.stored_val.len());
+      println!("  stored_kont:   {}", prog.stored_kont.len());
+      println!("  flow_ee/ea/ae/aa: {}/{}/{}/{}",
+         prog.flow_ee.len(), prog.flow_ea.len(), prog.flow_ae.len(), prog.flow_aa.len());
+      println!("  total derived: {derived}");
+      println!("  time:          {:.3?}", elapsed);
+   } else {
+      println!("N={n:<4} K={k:<3} P={p:<2} input={n_input:<6} derived={derived:<8} time={:>10.3?}",
+         elapsed);
+   }
+}
+
+/// Variation: run the generalized analysis at m = 0, 1, 2 on the same term,
+/// reproducing the paper's headline experiment. With too little polyvariance
+/// (small m) distinct calls are conflated and the analysis explodes; with
+/// enough context it is precise and fast (cf. Table 1).
+fn cfa_sweep(n: usize, k: usize, p: usize) {
+   use scheme_mcfa::{Facts, analyze_generic, worst_case_term};
+   let facts = Facts::from_ast(&worst_case_term(n, k, p));
+   println!("m-CFA polyvariance sweep on worst-case term N={n} K={k} P={p} ({} input facts)\n", facts.len());
+   println!("{:>3}  {:>12}  {:>12}", "m", "derived", "time");
+   for m in 0..=2 {
+      let start = Instant::now();
+      let stats = analyze_generic(&facts, m);
+      let elapsed = start.elapsed();
+      println!("{:>3}  {:>12}  {:>12.3?}", m, stats.total_derived(), elapsed);
+   }
+}
+
+fn fmt_ctx(c: &Ctx) -> String { format!("$Context({})", c.0) }
+fn fmt_addrk(a: &AddrK) -> String { format!("$KAddress({}, {})", a.e, fmt_ctx(&a.ctx)) }
+
+/// Dump ascent's pure-id relations in Soufflé's textual format so they can be
+/// diffed against Soufflé's `.csv` output on the same input (content-level
+/// cross-validation of the port).
+fn dump(dir: &str, n: usize, k: usize, p: usize) {
+   use std::fs;
+   let prog = scheme_mcfa::analyze(&worst_case_term(n, k, p));
+   let dir = std::path::Path::new(dir);
+   fs::create_dir_all(dir).unwrap();
+
+   let write = |name: &str, mut rows: Vec<String>| {
+      rows.sort();
+      fs::write(dir.join(format!("{name}.csv")), rows.join("\n") + "\n").unwrap();
+   };
+
+   write("flow_ee", prog.flow_ee.iter().map(|(a, b)| format!("{a}\t{b}")).collect());
+   write("freevar", prog.freevar.iter().map(|(x, e)| format!("{x}\t{e}")).collect());
+   write("peek_ctx", prog.peek_ctx.iter().map(|(e, o, nw)| format!("{e}\t{}\t{}", fmt_ctx(o), fmt_ctx(nw))).collect());
+   write("copy_ctx", prog.copy_ctx.iter().map(|(f, t, e)| format!("{}\t{}\t{e}", fmt_ctx(f), fmt_ctx(t))).collect());
+   write("state_e", prog.state_e.iter().map(|(e, c, ak)| format!("{e}\t{}\t{}", fmt_ctx(c), fmt_addrk(ak))).collect());
+   println!("dumped ascent relations (N={n} K={k} P={p}) to {}", dir.display());
+}
+
+/// A basic benchmark: run the faithful (appendix, `m=1`) analysis over a
+/// handful of worst-case term sizes so the whole sweep takes a
+/// measurable-but-modest amount of time (a few seconds total).
+///
+/// At `m=1` the `N` calls to `f` are conflated, so `z` takes `N` abstract
+/// values which then combine through the `K` nested `+`s, producing the
+/// polynomial `PrimVal` blow-up the paper studies. Cost grows with both `N`
+/// and (steeply) `K`.
+fn bench() {
+   println!("m-CFA (Ascent, faithful m=1) — worst-case term sweep");
+   println!("(N = calls to f, K = nested + applications, P = identity padding)\n");
+   let configs = [
+      (6, 2, 0),
+      (8, 2, 0),
+      (10, 3, 0),
+      (12, 3, 0),
+      (8, 4, 0),
+   ];
+   for (n, k, p) in configs {
+      run_once(n, k, p, false);
+   }
+}

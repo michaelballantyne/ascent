@@ -1,0 +1,15 @@
+[package]
+name = "scheme-mcfa"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Reproduction of 'So You Want To Analyze Scheme Programs With Datalog?' (m-CFA) in Ascent"
+license = "MIT"
+publish = false
+
+[dependencies]
+ascent = { path = "../ascent", version = "0.8.0" }
+
+[[bin]]
+name = "mcfa"
+path = "src/main.rs"
