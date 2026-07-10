@@ -1,0 +1,340 @@
+;; ======================================================================
+;; m-CFA for Scheme, ported to Slog -- TUNED version
+;; ======================================================================
+;;
+;; The same analysis as `mcfa.slog` (see its header comments), restructured
+;; for the Slog engine the way `src/structured_tuned.rs` restructures the
+;; Ascent structured port.  The OUTPUT relations (state_e, state_a,
+;; stored_val, stored_kont, flow_*, peek_ctx, copy_ctx, freevar, result)
+;; are identical in shape and content; only helper relations and join
+;; shapes differ.  Three changes:
+;;
+;;  1. LIST ACCESS HOISTED OUT OF THE MACHINE SCC.  `mcfa.slog` indexes
+;;     argument/parameter/binding lists with demand-moded helpers, whose
+;;     ask/answer plumbing lives inside the recursive machine stratum.
+;;     But every list the machine touches comes from the program SYNTAX,
+;;     which is fixed -- so here positional tables (`arg_at`, `param_at`,
+;;     `bind_in`, `names_of`) are materialized from the syntax subfacts in
+;;     a lower stratum, and the machine SCC reads them as closed relations
+;;     (single-version joins, no demand machinery, fewer rule versions).
+;;
+;;  2. READER-INDEX SPLITS (cf. structured_tuned.rs `var_read`/`copy_edge`).
+;;     The two triangle joins through the value store are each split into
+;;     two binary joins via a materialized intermediate, so BOTH semi-naive
+;;     delta directions are keyed probes:
+;;       - variable lookup:   state_e x ref x stored_val   via `var_read`
+;;       - flat-closure copy: copy_ctx x freevar x stored_val via `copy_edge`
+;;
+;;  3. `truthy` INLINED.  A-IfT is written once per truthy value shape,
+;;     removing a recursive helper relation from the machine SCC.
+
+;; ---------------------------------------------------------------------
+;; Syntax  (identical to mcfa.slog)
+;; ---------------------------------------------------------------------
+union (binding (bnd str expr))          ;; one `let` binding: name = rhs
+
+union (expr
+       (ref  int str)                   ;; variable reference
+       (cnum int int)                    ;; number literal
+       (cbool int str)                   ;; boolean literal, "#t" / "#f"
+       (lam  int (list str) expr)        ;; (lambda (x ...) body)
+       (app  int expr (list expr))       ;; (operator arg ...)
+       (if_e int expr expr expr)         ;; (if guard then else)
+       (let_e int (list binding) expr)   ;; (let ([x e] ...) body)
+       (set_e int str expr)              ;; (set! x e)
+       (callcc int expr)                 ;; (call/cc operand)
+       (prim int str expr expr))         ;; binary primitive (op a b)
+
+;; ---------------------------------------------------------------------
+;; Abstract machine domains  (identical to mcfa.slog)
+;; ---------------------------------------------------------------------
+union (context (ctx (list expr)))
+
+union (addrk (kaddr expr context))      ;; continuation address
+union (addrv (vaddr str context))       ;; value (binding) address
+
+union (value
+       (v_num  int)
+       (v_bool str)
+       (v_kont addrk)                   ;; a captured continuation
+       (v_clo  expr context)            ;; closure: a lambda + its birth context
+       (v_prim str value value))        ;; an abstract primitive application
+
+union (kont
+       (mt)                                       ;; halt
+       (k_arg  (list expr) context context addrk) ;; args, ctx, ectx, next
+       (k_fn   value int context addrk)           ;; func, arg-position, ectx, next
+       (k_set  addrv addrk)                        ;; loc, next
+       (k_if   expr expr context addrk)            ;; then, else, ctx, next
+       (k_cc   context addrk)                       ;; ectx, next
+       (k_let  addrv expr context addrk)            ;; loc, body, ctx, next
+       (k_prim1 str expr context addrk)             ;; op, e2, ctx, next
+       (k_prim2 str value addrk))                   ;; op, v1, next
+
+;; ---------------------------------------------------------------------
+;; Relations  (identical to mcfa.slog)
+;; ---------------------------------------------------------------------
+table (top expr)                        ;; the program (one closed expression)
+
+table (state_e expr context addrk)      ;; "eval" state:  evaluate e in ctx with cont ak
+table (state_a value addrk)             ;; "apply" state: value v is ready for cont ak
+table (stored_val addrv value)          ;; the value store  (addr -> {values})
+table (stored_kont addrk kont)          ;; the continuation store
+
+table (flow_ee expr expr)               ;; control flow: expr steps to expr
+table (flow_ea expr value)              ;; expr evaluated to value
+table (flow_aa value value)             ;; value flows to value
+table (flow_ae value expr)              ;; value delivered to expr
+
+table (peek_ctx expr context context)   ;; context created when entering e
+table (copy_ctx context context expr)   ;; copy free-var bindings from ctx to ctx (for e)
+table (freevar str expr)                ;; x occurs free in e
+
+table (result value)                    ;; a value reaching the empty (halt) continuation
+
+;; ---------------------------------------------------------------------
+;; TUNING 1: positional list tables, materialized from the syntax.
+;; Every argument list is a field of some `app` subfact, every parameter
+;; list of some `lam`, every binding list of some `let_e` -- so these
+;; tables are complete for every list the machine can ever touch, and
+;; they are computed before the machine stratum starts.
+;; ---------------------------------------------------------------------
+;; (position, element) of every application's argument list
+table (arg_walk (list expr) (list expr) int)   ;; original, suffix, position
+table (arg_at (list expr) int expr)
+rule e = (app _ f args) --> (arg_walk args args 0)
+rule (arg_walk orig [a as ...] i) --> (arg_at orig i a)
+rule (arg_walk orig [a as ...] i) (= j (+ i 1)) --> (arg_walk orig as j)
+
+;; (position, name) of every lambda's parameter list
+table (param_walk (list str) (list str) int)
+table (param_at (list str) int str)
+rule e = (lam _ params b) --> (param_walk params params 0)
+rule (param_walk orig [p ps ...] i) --> (param_at orig i p)
+rule (param_walk orig [p ps ...] i) (= j (+ i 1)) --> (param_walk orig ps j)
+
+;; every suffix of every `let`'s binding list, split as (suffix, head, tail);
+;; the (l, l) pair trick keeps the whole list bound while its copy is matched
+table (suffix_walk (list binding) (list binding))
+table (bind_split (list binding) binding (list binding))
+rule e = (let_e _ binds b) --> (suffix_walk binds binds)
+rule (suffix_walk l [b bs ...]) --> (bind_split l b bs) (suffix_walk bs bs)
+
+;; each binding of a binding list (head, or member of the tail)
+table (bind_in (list binding) binding)
+rule (bind_split l b bs) --> (bind_in l b)
+rule (bind_split l _ bs) (bind_in bs b) --> (bind_in l b)
+
+;; the bound-name list of every binding-list suffix (built base-up)
+table (names_of (list binding) (list str))
+rule (names_of [] [])
+rule (bind_split l (bnd nm rhs) bs) (names_of bs ns) --> (names_of l [nm ns ...])
+
+;; ---------------------------------------------------------------------
+;; Free variables  (same rules as mcfa.slog, over the hoisted tables)
+;; ---------------------------------------------------------------------
+rule id = (ref _ x) --> (freevar x id)
+
+;; lambda: free in body, and NOT one of the parameters  (`lmem` < 1 = absent)
+rule id = (lam _ params body)
+     (freevar x body)
+     (= m (lmem params x))
+     (< m 1)
+ --> (freevar x id)
+
+;; application: free in the operator, or free in some argument
+rule id = (app _ func args) (freevar x func)              --> (freevar x id)
+rule id = (app _ func args) (arg_at args _ a) (freevar x a) --> (freevar x id)
+
+;; binary primitive
+rule id = (prim _ op a b) (freevar x a) --> (freevar x id)
+rule id = (prim _ op a b) (freevar x b) --> (freevar x id)
+
+;; if
+rule id = (if_e _ g t f) (freevar x g) --> (freevar x id)
+rule id = (if_e _ g t f) (freevar x t) --> (freevar x id)
+rule id = (if_e _ g t f) (freevar x f) --> (freevar x id)
+
+;; set!: the RHS only -- the assigned variable is NOT counted free (per paper)
+rule id = (set_e _ v ev) (freevar y ev) --> (freevar y id)
+
+;; call/cc
+rule id = (callcc _ ev) (freevar x ev) --> (freevar x id)
+
+;; let: the body is intentionally NOT scoped by the bound names (per paper);
+;; each binding RHS is scoped (its free vars minus ALL bound names)
+rule id = (let_e _ binds body) (freevar x body) --> (freevar x id)
+rule id = (let_e _ binds body)
+     (bind_in binds (bnd nm rhs))
+     (freevar x rhs)
+     (names_of binds names)
+     (= m (lmem names x))
+     (< m 1)
+ --> (freevar x id)
+
+;; ---------------------------------------------------------------------
+;; Injection
+;; ---------------------------------------------------------------------
+rule (top e)
+ -->
+     (state_e e (ctx []) (kaddr e (ctx [])))
+     (peek_ctx e (ctx []) (ctx [e]))
+     (stored_kont (kaddr e (ctx [])) (mt))
+
+;; ---------------------------------------------------------------------
+;; peek_ctx: a new context is created only at a binding form
+;; ---------------------------------------------------------------------
+rule (state_e e old _) e = (app _ _ _)   --> (peek_ctx e old (ctx [e]))
+rule (state_e e old _) e = (let_e _ _ _) --> (peek_ctx e old (ctx [e]))
+rule (state_e e old _) e = (callcc _ _)  --> (peek_ctx e old (ctx [e]))
+rule (state_e e old _) e = (lam _ _ _)   --> (peek_ctx e old (ctx [e]))
+
+;; ---------------------------------------------------------------------
+;; TUNING 2a: copy_ctx split through the `copy_edge` reader index.
+;; copy_edge(fv, from, to) says: address (fv, from) flows to (fv, to).
+;; ---------------------------------------------------------------------
+table (copy_edge str context context)
+rule (copy_ctx from to e) (freevar fv e) --> (copy_edge fv from to)
+rule (copy_edge fv from to) (stored_val (vaddr fv from) v)
+ --> (stored_val (vaddr fv to) v)
+
+;; ---------------------------------------------------------------------
+;; E-rules: decompose the expression under evaluation
+;; ---------------------------------------------------------------------
+;; E-If
+rule (state_e e ctx ak) e = (if_e _ eguard et ef)
+ --> (state_e eguard ctx (kaddr eguard ctx))
+     (stored_kont (kaddr eguard ctx) (k_if et ef ctx ak))
+     (flow_ee e eguard)
+
+;; E-C/cc
+rule (state_e e ctx ak) e = (callcc _ elam) (peek_ctx e ctx ectx)
+ --> (state_e elam ctx (kaddr elam ctx))
+     (stored_kont (kaddr elam ctx) (k_cc ectx ak))
+     (flow_ee e elam)
+
+;; E-Set!
+rule (state_e e ctx ak) e = (set_e _ x esetto)
+ --> (state_e esetto ctx (kaddr esetto ctx))
+     (stored_kont (kaddr esetto ctx) (k_set (vaddr x ctx) ak))
+     (flow_ee e esetto)
+
+;; E-Call
+rule (state_e e ctx ak) e = (app _ efunc eargs) (peek_ctx e ctx ectx)
+ --> (state_e efunc ctx (kaddr efunc ctx))
+     (stored_kont (kaddr efunc ctx) (k_arg eargs ctx ectx ak))
+     (flow_ee e efunc)
+
+;; E-Let
+rule (state_e e ctx ak)
+     e = (let_e _ binds ebody)
+     (peek_ctx e ctx ectx)
+     (bind_in binds (bnd x ebnd))
+ --> (state_e ebnd ctx (kaddr ebnd ctx))
+     (stored_kont (kaddr ebnd ctx) (k_let (vaddr x ectx) ebody ectx ak))
+     (copy_ctx ctx ectx e)
+     (flow_ee e ebnd)
+
+;; E-Prim
+rule (state_e e ctx ak) e = (prim _ op earg0 earg1)
+ --> (state_e earg0 ctx (kaddr earg0 ctx))
+     (stored_kont (kaddr earg0 ctx) (k_prim1 op earg1 ctx ak))
+     (flow_ee e earg0)
+
+;; ---------------------------------------------------------------------
+;; Atomic evaluation: an expression that is already a value
+;; ---------------------------------------------------------------------
+rule (state_e e _ ak) e = (cnum _ n)  --> (state_a (v_num n) ak)  (flow_ea e (v_num n))
+rule (state_e e _ ak) e = (cbool _ b) --> (state_a (v_bool b) ak) (flow_ea e (v_bool b))
+rule (state_e e ctx ak) e = (lam _ _ _)
+ --> (state_a (v_clo e ctx) ak) (flow_ea e (v_clo e ctx))
+
+;; TUNING 2b: variable lookup split through the `var_read` reader index.
+;; var_read(x, ctx, e, ak) says: occurrence e of variable x is being
+;; evaluated in ctx, waiting on address (x, ctx).
+table (var_read str context expr addrk)
+rule (state_e e ctx ak) e = (ref _ x) --> (var_read x ctx e ak)
+rule (var_read x ctx e ak) (stored_val (vaddr x ctx) v)
+ --> (state_a v ak) (flow_ea e v)
+
+;; ---------------------------------------------------------------------
+;; A-rules: deliver a value to its continuation
+;; ---------------------------------------------------------------------
+;; TUNING 3: A-IfT written once per truthy value shape (everything but #f
+;; is true; a v_prim is neither true nor false, per the paper).
+rule (state_a v ak) v = (v_bool "#t") (stored_kont ak (k_if et ef ck nak))
+ --> (state_e et ck nak) (flow_ae (v_bool "#t") et)
+rule (state_a v ak) v = (v_num n) (stored_kont ak (k_if et ef ck nak))
+ --> (state_e et ck nak) (flow_ae (v_bool "#t") et)
+rule (state_a v ak) v = (v_clo l c) (stored_kont ak (k_if et ef ck nak))
+ --> (state_e et ck nak) (flow_ae (v_bool "#t") et)
+rule (state_a v ak) v = (v_kont a) (stored_kont ak (k_if et ef ck nak))
+ --> (state_e et ck nak) (flow_ae (v_bool "#t") et)
+
+;; A-IfF
+rule (state_a (v_bool "#f") ak) (stored_kont ak (k_if et ef ck nak))
+ --> (state_e ef ck nak) (flow_ae (v_bool "#f") ef)
+
+;; A-C/cc: a closure applied to the reified current continuation.  The
+;; captured continuation (v_kont ak) is bound to the closure's FIRST parameter.
+rule (state_a (v_clo elam ctx_clo) ak)
+     (stored_kont ak (k_cc ectx nak))
+     elam = (lam _ [x ps ...] ebody)
+ --> (state_e ebody ectx nak)
+     (stored_val (vaddr x ectx) (v_kont ak))
+     (copy_ctx ctx_clo ectx elam)
+     (flow_ae (v_clo elam ctx_clo) ebody)
+
+;; A-C/ccKont: call/cc's operand evaluated to a continuation itself
+rule (state_a (v_kont bk) ak) (stored_kont ak (k_cc _ _))
+ --> (state_a (v_kont ak) bk) (flow_aa (v_kont bk) (v_kont ak))
+
+;; A-Ar: the operator value has arrived; evaluate EVERY argument under a
+;; `k_fn` cont carrying the operator value and the argument's position
+;; (fires for ANY operator value, per the paper -- see mcfa.slog).
+rule (state_a v ak)
+     (stored_kont ak (k_arg eargs ctx ectx nak))
+     (arg_at eargs pos earg)
+ --> (state_e earg ctx (kaddr earg ctx))
+     (stored_kont (kaddr earg ctx) (k_fn v pos ectx nak))
+     (flow_ae v earg)
+
+;; A-Call (closure): an argument value has arrived; bind the parameter at the
+;; argument's position in the callee context and evaluate the body.  (The
+;; `param_at` join is also the arity filter.)
+rule (state_a v ak)
+     (stored_kont ak (k_fn (v_clo elam ctx_clo) pos ectx nak))
+     elam = (lam _ params ebody)
+     (param_at params pos x)
+ --> (state_e ebody ectx nak)
+     (stored_val (vaddr x ectx) v)
+     (copy_ctx ctx_clo ectx elam)
+     (flow_ae v ebody)
+
+;; A-Call (continuation as operator): deliver the FIRST argument's value to
+;; the continuation (position 0 only, per the paper)
+rule (state_a v ak) (stored_kont ak (k_fn (v_kont callcc_kont) 0 _ _))
+ --> (state_a v callcc_kont) (flow_aa v v)
+
+;; A-Let: the bound RHS value has arrived; store it and run the body
+rule (state_a v ak) (stored_kont ak (k_let av ebody ctx nak))
+ --> (state_e ebody ctx nak) (stored_val av v) (flow_ae v ebody)
+
+;; A-Prim1: first primitive operand done; evaluate the second
+rule (state_a v ak) (stored_kont ak (k_prim1 op earg1 ctx nak))
+ --> (state_e earg1 ctx (kaddr earg1 ctx))
+     (stored_kont (kaddr earg1 ctx) (k_prim2 op v nak))
+     (flow_ae v earg1)
+
+;; A-Prim2: both operands done; produce the abstract primitive value
+rule (state_a v2 ak) (stored_kont ak (k_prim2 op v1 nak))
+ --> (state_a (v_prim op v1 v2) nak) (flow_aa v2 (v_prim op v1 v2))
+
+;; A-Set!: store into the location; set! itself yields a dummy (-42)
+rule (state_a v ak) (stored_kont ak (k_set loc nak))
+ --> (state_a (v_num -42) nak) (stored_val loc v) (flow_aa v (v_num -42))
+
+;; ---------------------------------------------------------------------
+;; Result: a value reaching the halt (empty) continuation
+;; ---------------------------------------------------------------------
+rule (state_a v ak) (stored_kont ak (mt)) --> (result v)

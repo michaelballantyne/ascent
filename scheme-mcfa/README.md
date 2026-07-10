@@ -52,6 +52,7 @@ This crate:
 | `souffle/mcfa.dl` | The original Soufflé program, transcribed verbatim from Appendix A (only change: Soufflé 2.4.1 spells the nullary constructor `$MT()`). |
 | `souffle/mcfa_adt.dl` | **Experiment:** a Soufflé version that carries syntax as an `expr` ADT instead of flat relations, to test whether ADTs regress performance. |
 | `souffle/mcfa_tuned.dl` | **Experiment:** the Soufflé program tuned with per-version `.plan` directives and an internally-flattened store (148× on church(80)). |
+| `slog/` | The structured (occurrence-labelled) analysis ported to Slog: `mcfa.slog` (faithful), `mcfa-tuned.slog` (engine-tuned, identical output), examples, and `bench-slog.sh` (emits terms via `mcfa emit-slog`, validates every run against the Ascent analysis, reports fixpoint times). See `slog/README.md`. |
 | `tests/cross_check.rs` | Runs Ascent and Soufflé on the same input and asserts the outputs agree. |
 | `tests/generic_check.rs` | Checks generic `m=1` ≡ the faithful port, reproduces the polyvariance/padding phenomena, and checks parallel ≡ sequential. |
 | `tests/structured_check.rs` | Checks the structured variant against the flat one: the occurrence-labelled tree matches on every term; hash-consing conflates repeated subterms — merging states on some terms, losing precision on others. |
@@ -91,6 +92,11 @@ RAYON_NUM_THREADS=4 cargo run --release -p scheme-mcfa -- church-par 80 1
 
 # Emit equivalent Soufflé .facts for a term:
 cargo run --release -p scheme-mcfa -- emit-souffle /tmp/facts 10 3 0
+
+# Emit a term as a Slog program (plus expected relation sizes), and the
+# Slog-vs-Ascent benchmark driver (see slog/README.md):
+cargo run --release -p scheme-mcfa -- emit-slog /tmp/church-40.slog church 40
+SLOG_DIR=/path/to/slog scheme-mcfa/slog/bench-slog.sh "church 40"
 ```
 
 ## Cross-validation against Soufflé

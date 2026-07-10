@@ -23,9 +23,11 @@ ADTs are — no flat id-relations. Concretely it corresponds to
 | File | Contents |
 |------|----------|
 | `mcfa.slog` | The whole analysis: syntax/value/continuation `union`s, the negation-free `freevar`, and every machine rule. `include` it. |
+| `mcfa-tuned.slog` | The same analysis restructured for the Slog engine (list access hoisted out of the machine SCC, `var_read`/`copy_edge` reader-index splits, `truthy` inlined) — same output relations, row-for-row. See [Tuning](#tuning-mcfa-tunedslog). |
 | `example-arith.slog` | `let`, multi-arg `lambda`, application, `if`, a binary primitive. |
 | `example-callcc.slog` | `call/cc` (normal-return path). |
 | `example-setbang.slog` | `set!`. |
+| `bench-slog.sh` | Benchmark driver: emits the crate's benchmark terms (`mcfa emit-slog`), runs both analysis files under Slog, validates every output relation against the Ascent structured analysis, and reports median fixpoint times. |
 
 ## Running
 
@@ -107,14 +109,19 @@ preserved.
 ### Multi-argument application over lists
 
 Multi-argument `lambda`/`app` and multi-binding `let` carry Slog lists
-(`(lambda (x ...) body)` → `(lam L [x ...] body)`). Rather than the paper's
-positional `Fn{…, pos, …}` continuation indexing a parameter list by integer,
-the `k_fn` continuation carries the **parameter name** being bound, obtained
-by zipping the argument list against the callee's parameter list at the A-Ar
-step (`zip2`). This is equivalent and avoids positional list access. Small
-demand-moded helpers (`expr_in`, `bind_in`, `bind_names`, `zip2`) enumerate /
-zip these lists; each is driven in the bound direction by an already-ground
-list.
+(`(lambda (x ...) body)` → `(lam L [x ...] body)`). As in the paper, the
+`k_fn` continuation carries the argument's integer **position**; the
+demand-moded helpers `expr_at`/`param_at` provide the positional list access
+(`(expr_at args pos earg)`, `(param_at params pos x)`). A-Ar therefore fires
+for **any** operator value and every argument position — non-applicable
+operators still get their arguments evaluated, exactly as the paper's rules
+do — and A-Call's `param_at` join doubles as the arity filter. (An earlier
+draft instead zipped arguments against the callee's parameter names at the
+A-Ar step; that under-approximated the paper — no argument evaluation under
+non-closure operators, none past the callee's arity, and only the first
+argument of an applied continuation.) Small demand-moded helpers (`expr_in`,
+`bind_in`, `bind_names`, `expr_at`, `param_at`) enumerate/index these lists;
+each is driven in the bound direction by an already-ground list.
 
 ## Faithful limitations
 
@@ -124,3 +131,47 @@ continuation with a non-closure value has no forwarding rule**, so such a path
 simply produces no further states (a sound loss of precision). This matches
 the crate and the Soufflé program; `example-callcc.slog` therefore exercises
 the normal-return path.
+
+## Tuning (`mcfa-tuned.slog`)
+
+The tuned file computes the **identical** analysis (every output relation
+row-for-row equal, which `bench-slog.sh` checks on every run); only helper
+relations and join shapes change. Three restructurings, chosen for how this
+Slog engine evaluates (one fused pipeline per semi-naive rule version,
+greedy body scheduling, closed lower-stratum relations read without deltas):
+
+1. **List access hoisted out of the machine SCC.** The faithful port
+   indexes argument/parameter/binding lists with demand-moded helpers whose
+   ask/answer plumbing lives *inside* the recursive machine stratum. But
+   every list the machine touches comes from the program syntax, which is
+   fixed — so the tuned file materializes positional tables (`arg_at`,
+   `param_at`, `bind_in`, `names_of`) from the syntax subfacts in a lower
+   stratum, and the machine SCC reads them as closed relations.
+2. **Reader-index splits** (the same `var_read`/`copy_edge` intermediates
+   as `src/structured_tuned.rs`): the two triangle joins through the value
+   store — variable lookup (`state_e` ⋈ `ref` ⋈ `stored_val`) and the
+   flat-closure copy (`copy_ctx` ⋈ `freevar` ⋈ `stored_val`) — are each
+   split into two binary joins via a materialized intermediate, so both
+   semi-naive delta directions are keyed probes.
+3. **`truthy` inlined**: A-IfT is written once per truthy value shape,
+   removing a recursive helper relation (and its rule versions) from the
+   machine SCC.
+
+## Benchmarking
+
+`bench-slog.sh` ties the two systems together: it emits the crate's
+benchmark terms as Slog programs (`mcfa emit-slog`, per-occurrence labels),
+runs each against both `mcfa.slog` and `mcfa-tuned.slog`, **validates every
+output relation's cardinality against the Ascent structured analysis** on
+the same term, diffs tuned against faithful row-for-row, and reports the
+median summed per-stratum fixpoint time (the daemon's `(fixpoint …)` lines
+— pure evaluation, excluding compile/parse/CSV I/O, so it is the number
+comparable to the in-process Ascent timings from `mcfa engines`).
+
+```sh
+SLOG_DIR=/path/to/slog ./bench-slog.sh                  # default sweep
+SLOG_DIR=/path/to/slog ./bench-slog.sh "worst 12 3 0"   # one term
+```
+
+<!-- BENCH-RESULTS -->
+

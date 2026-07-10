@@ -9,3 +9,4 @@ ez3_base/
 ez3_tests/
 .z3-trace
 nll-facts/
+scheme-mcfa/slog/bench-out/
