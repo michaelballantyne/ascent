@@ -117,3 +117,42 @@ fn ascent_matches_souffle() {
    cross_check("worst_8_2_0", &worst_case_term(8, 2, 0));
    cross_check("church_6", &church_term(6));
 }
+
+/// The `.plan`-tuned Soufflé program (`souffle/mcfa_tuned.dl`) must produce
+/// exactly the same output relations as the faithful one on the same input.
+#[test]
+fn tuned_souffle_matches_untuned() {
+   if !souffle_available() {
+      eprintln!("skipping souffle-tuned check: `souffle` not found on PATH (set SOUFFLE=...)");
+      return;
+   }
+   for (name, ast) in [("features", feature_term()), ("worst_4_2_1", worst_case_term(4, 2, 1)), ("church_6", church_term(6))] {
+      let tmp: PathBuf = std::env::temp_dir().join(format!("mcfa_sftuned_{name}"));
+      let facts_dir = tmp.join("facts");
+      let _ = std::fs::remove_dir_all(&tmp);
+      std::fs::create_dir_all(&facts_dir).unwrap();
+      Facts::from_ast(&ast).write_souffle(&facts_dir).unwrap();
+
+      let mut outs = Vec::new();
+      for dl in ["souffle/mcfa.dl", "souffle/mcfa_tuned.dl"] {
+         let out_dir = tmp.join(dl.replace(['/', '.'], "_"));
+         std::fs::create_dir_all(&out_dir).unwrap();
+         let dl_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(dl);
+         let status = Command::new(souffle_bin())
+            .args(["-F", facts_dir.to_str().unwrap(), "-D", out_dir.to_str().unwrap(), dl_path.to_str().unwrap()])
+            .status()
+            .expect("run souffle");
+         assert!(status.success(), "souffle failed on {dl} for term {name}");
+         outs.push(out_dir);
+      }
+
+      for rel in
+         ["state_e", "state_a", "stored_val", "stored_kont", "flow_ee", "flow_ea", "flow_ae", "flow_aa", "freevar", "peek_ctx", "copy_ctx"]
+      {
+         let a = read_csv(&outs[0].join(format!("{rel}.csv")));
+         let b = read_csv(&outs[1].join(format!("{rel}.csv")));
+         assert_eq!(a, b, "term {name}: relation {rel} differs between mcfa.dl and mcfa_tuned.dl");
+      }
+      let _ = std::fs::remove_dir_all(&tmp);
+   }
+}
