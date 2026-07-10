@@ -5,7 +5,11 @@
 //! mcfa run   [N] [K] [P]        # run once on the worst-case term (N calls, K pluses, P padding)
 //! mcfa bench                    # sweep a few term sizes and print a timing table
 //! mcfa emit-souffle DIR [N K P] # write equivalent Soufflé .facts files into DIR
+//! mcfa emit-egglog FILE <termspec>  # write one egglog fact per line into FILE
+//! mcfa emit-flix DIR <termspec>     # write equivalent Flix/Soufflé .facts files into DIR
+//! mcfa expected <termspec>          # run the tuned program, print per-relation counts
 //! ```
+//! where `<termspec>` is `worst N K P` | `church N` | `feature`.
 
 use std::env;
 use std::path::Path;
@@ -157,9 +161,51 @@ fn main() {
          let p = arg(&args, 5, 1);
          dump(&dir, n, k, p);
       },
+      "emit-egglog" => {
+         let file = args.get(2).cloned().unwrap_or_else(|| {
+            eprintln!("emit-egglog needs a target FILE");
+            std::process::exit(1);
+         });
+         let (ast, desc) = parse_termspec(&args, 3);
+         let facts = Facts::from_ast(&ast);
+         emit_egglog(Path::new(&file), &facts).expect("write egglog facts");
+         println!("wrote {} input facts ({desc}) as egglog facts into {file}", facts.len());
+      },
+      "emit-flix" => {
+         let dir = args.get(2).cloned().unwrap_or_else(|| {
+            eprintln!("emit-flix needs a target DIR");
+            std::process::exit(1);
+         });
+         let (ast, desc) = parse_termspec(&args, 3);
+         let facts = Facts::from_ast(&ast);
+         facts.write_souffle(Path::new(&dir)).expect("write souffle/flix facts");
+         println!("wrote {} input facts ({desc}) as flix/souffle .facts files into {dir}", facts.len());
+      },
+      "expected" => {
+         let (ast, desc) = parse_termspec(&args, 2);
+         let facts = Facts::from_ast(&ast);
+         eprintln!("expected counts for {desc} ({} input facts)", facts.len());
+         let mut prog = facts.into_tuned_program();
+         prog.run();
+         println!("state_e {}", prog.state_e.len());
+         println!("state_a {}", prog.state_a.len());
+         println!("stored_val {}", prog.stored_val.len());
+         println!("stored_kont {}", prog.stored_kont.len());
+         println!("flow_ee {}", prog.flow_ee.len());
+         println!("flow_ea {}", prog.flow_ea.len());
+         println!("flow_ae {}", prog.flow_ae.len());
+         println!("flow_aa {}", prog.flow_aa.len());
+         println!("peek_ctx {}", prog.peek_ctx.len());
+         println!("copy_ctx {}", prog.copy_ctx.len());
+         println!("freevar {}", prog.freevar.len());
+      },
       other => {
          eprintln!("unknown command: {other}");
-         eprintln!("usage: mcfa [run N K P | bench | emit-souffle DIR N K P | dump DIR N K P]");
+         eprintln!(
+            "usage: mcfa [run N K P | bench | emit-souffle DIR N K P | dump DIR N K P \
+             | emit-egglog FILE <termspec> | emit-flix DIR <termspec> | expected <termspec>]"
+         );
+         eprintln!("  <termspec> := worst N K P | church N | feature");
          std::process::exit(1);
       },
    }
@@ -167,6 +213,91 @@ fn main() {
 
 fn arg(args: &[String], i: usize, default: usize) -> usize {
    args.get(i).and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+/// Parse a `<termspec>` — `worst N K P` | `church N` | `feature` — starting at
+/// `args[i]`, returning the built [`scheme_mcfa::Ast`] and a short description.
+/// Shared by `emit-egglog`, `emit-flix`, and `expected`.
+fn parse_termspec(args: &[String], i: usize) -> (scheme_mcfa::Ast, String) {
+   let kind = args.get(i).map(|s| s.as_str()).unwrap_or("worst");
+   match kind {
+      "worst" => {
+         let n = arg(args, i + 1, 20);
+         let k = arg(args, i + 2, 3);
+         let p = arg(args, i + 3, 0);
+         (worst_case_term(n, k, p), format!("worst N={n} K={k} P={p}"))
+      },
+      "church" => {
+         let n = arg(args, i + 1, 8);
+         (scheme_mcfa::church_term(n), format!("church(sum 0..={n})"))
+      },
+      "feature" => (scheme_mcfa::feature_term(), "feature".to_string()),
+      other => {
+         eprintln!("unknown term spec: {other}");
+         eprintln!("expected: worst N K P | church N | feature");
+         std::process::exit(1);
+      },
+   }
+}
+
+/// Write `facts` (plus the precomputed `freevar` relation) as one egglog fact
+/// per line into `path`: `(relation "str-arg" ... i64-arg ...)`, strings
+/// double-quoted, i64s bare. Relation names/arities mirror the Soufflé ones
+/// (`bool` -> `boolean`, `if` -> `if_`, `let` -> `let_`); `prim` and
+/// `quotation` are skipped since the rules never read them.
+fn emit_egglog(path: &Path, facts: &Facts) -> std::io::Result<()> {
+   use std::fs::File;
+   use std::io::Write;
+
+   let mut f = File::create(path)?;
+   let q = |s: &str| format!("\"{s}\"");
+
+   for (a,) in &facts.top_exp {
+      writeln!(f, "(top_exp {})", q(a))?;
+   }
+   for (a, b, c) in &facts.lambda {
+      writeln!(f, "(lambda {} {} {})", q(a), q(b), q(c))?;
+   }
+   for (vars, pos, x) in &facts.lambda_arg_list {
+      writeln!(f, "(lambda_arg_list {} {pos} {})", q(vars), q(x))?;
+   }
+   for (a, op, args) in &facts.prim_call {
+      writeln!(f, "(prim_call {} {} {})", q(a), q(op), q(args))?;
+   }
+   for (a, func, args) in &facts.call {
+      writeln!(f, "(call {} {} {})", q(a), q(func), q(args))?;
+   }
+   for (args, pos, x) in &facts.call_arg_list {
+      writeln!(f, "(call_arg_list {} {pos} {})", q(args), q(x))?;
+   }
+   for (a, x) in &facts.var {
+      writeln!(f, "(var {} {})", q(a), q(x))?;
+   }
+   for (a, n) in &facts.num {
+      writeln!(f, "(num {} {n})", q(a))?;
+   }
+   for (a, b) in &facts.boolean {
+      writeln!(f, "(boolean {} {})", q(a), q(b))?;
+   }
+   for (a, guard, t, fa) in &facts.if_ {
+      writeln!(f, "(if_ {} {} {} {})", q(a), q(guard), q(t), q(fa))?;
+   }
+   for (a, x, e) in &facts.setb {
+      writeln!(f, "(setb {} {} {})", q(a), q(x), q(e))?;
+   }
+   for (a, e) in &facts.callcc {
+      writeln!(f, "(callcc {} {})", q(a), q(e))?;
+   }
+   for (a, binds, body) in &facts.let_ {
+      writeln!(f, "(let_ {} {} {})", q(a), q(binds), q(body))?;
+   }
+   for (binds, x, e) in &facts.let_list {
+      writeln!(f, "(let_list {} {} {})", q(binds), q(x), q(e))?;
+   }
+   for (x, e) in scheme_mcfa::freevars(facts) {
+      writeln!(f, "(freevar {} {})", q(&x), q(&e))?;
+   }
+   Ok(())
 }
 
 fn run_once(n: usize, k: usize, p: usize, verbose: bool) {

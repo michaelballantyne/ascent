@@ -52,11 +52,18 @@ This crate:
 | `souffle/mcfa.dl` | The original Soufflé program, transcribed verbatim from Appendix A (only change: Soufflé 2.4.1 spells the nullary constructor `$MT()`). |
 | `souffle/mcfa_adt.dl` | **Experiment:** a Soufflé version that carries syntax as an `expr` ADT instead of flat relations, to test whether ADTs regress performance. |
 | `souffle/mcfa_tuned.dl` | **Experiment:** the Soufflé program tuned with per-version `.plan` directives and an internally-flattened store (148× on church(80)). |
+| `slog/mcfa.slog` | Port to **Slog** (structured syntax as first-class values; see `slog/README.md`). |
+| `egglog/mcfa.egg` | Port to **egglog** (values/continuations as hash-consed datatypes, nested patterns in rule bodies; see `egglog/README.md` — including why *no* tuned variant exists). |
+| `flix/mcfa.flix` | Port to **Flix**'s first-class Datalog (per-variant continuation relations and a flattened store, both *forced* by Flix's body-atom restrictions; see `flix/README.md`). |
+| `flix/mcfa_tuned.flix` | The Flix port with the `src/tuned.rs`-style delta-friendly rewrite (materialized redex relations, shadow decomposition relations). |
+| `src/freevar.rs` | Standalone `freevar` computation (the ten rules, verbatim) used by `mcfa emit-egglog` — egglog has no negation, so its `freevar` ships as input facts. |
 | `tests/cross_check.rs` | Runs Ascent and Soufflé on the same input and asserts the outputs agree. |
 | `tests/generic_check.rs` | Checks generic `m=1` ≡ the faithful port, reproduces the polyvariance/padding phenomena, and checks parallel ≡ sequential. |
 | `tests/structured_check.rs` | Checks the structured variant against the flat one: the occurrence-labelled tree matches on every term; hash-consing conflates repeated subterms — merging states on some terms, losing precision on others. |
 | `tests/aam_check.rs` | Checks both hand-written machines derive **content-identical** relations (states, stores, flow graph) to the Ascent program, on both labelings, at `m = 0/1/2`. |
 | `tests/tuned_check.rs` | Checks the tuned programs compute the identical analysis to their untuned counterparts (flat: sizes + `stored_val`/`flow_ee` content; structured: all relation sizes, both labelings, `m = 0/1/2`). |
+| `tests/egglog_check.rs` | Cross-checks the egglog port's relation sizes against Ascent (skipped unless `egglog` is on PATH / `EGGLOG` is set). |
+| `tests/flix_check.rs` | Cross-checks both Flix ports' relation sizes against Ascent (runs only when `FLIX_JAR` is set — each run recompiles ~30 s). |
 
 ## Running
 
@@ -444,6 +451,85 @@ loudly (a slow benchmark) rather than silently (a quadratic worklist that
 looks fine on small tests). Written with that discipline, *both* Datalog
 engines land within ~2× of the hand-written machines on the deep Church term —
 and tuned Soufflé is actually the fastest engine on the wide worst-case term.
+
+## Two more engines: egglog and Flix
+
+The same analysis (same `m = 1` fixpoint, cardinality-verified against Ascent
+by `tests/egglog_check.rs` / `tests/flix_check.rs`) ported to two engines
+with very different theories of what a Datalog program is:
+[egglog](https://github.com/egraphs-good/egglog) (`egglog/`, Datalog over a
+hash-consed e-graph term store) and [Flix](https://flix.dev/) (`flix/`,
+first-class Datalog values inside a typed functional language). Each
+directory's README has the full story; the short version is that they land
+on *opposite ends* of every axis this crate has been mapping.
+
+**Expressiveness.** egglog is the most direct host yet: rule bodies match
+nested constructor patterns anywhere (even `KFn(VClosure(..), ..)`, two
+levels deep, straight off the appendix), multi-head rules survive as
+multi-action rules, and the port is *shorter than the Soufflé original*. Its
+one gap is negation — `freevar` must be precomputed and shipped as input
+facts (`mcfa emit-egglog`). Flix is the most restrictive: body atoms admit
+only variables/wildcards/constants, so the paper's `stored_kont(ak, $If(..))`
+is unwritable — the continuation store must become one relation per variant
+and the value store must be flattened into columns. Which is to say:
+**Flix's type discipline forces, on day one, the exact schema the tuned
+Ascent and tuned Soufflé ports had to discover by profiling.** (It cannot
+force delta-friendly *rule* shape, though: the straightforward Flix port
+re-evaluates each multi-head body 3–4× and needs a `mcfa_tuned.flix` just
+like Ascent did. The port also surfaced a genuine Flix 0.75.1 soundness bug
+— a functional-predicate output used as a later atom's argument is not
+join-constrained — plus an optimizer that inlines pure once-used `solve`s
+right through your timing code; see `flix/README.md`.)
+
+**Performance.** All engines on this machine (4-core sandbox; in-process
+engines exclude fact prep; egglog is whole-process, ~10 ms–0.5 s of which is
+parse/load; Flix is in-process `solve` time, excluding its ~30 s compile):
+
+| engine (single thread) | worst `N=12 K=3` | church(60) | church(80) |
+|---|---:|---:|---:|
+| ascent (flat, faithful) | 1.57 s | 1.07 s | 3.22 s |
+| ascent (flat, tuned) | 1.45 s | 0.089 s | 0.137 s |
+| AAM (delta worklist) | 2.09 s | 0.026 s | 0.044 s |
+| **egglog** | **0.63 s** | 3.5 s | 7.0 s |
+| **Flix** (straightforward) | 19.4 s | 280 s | — (not run) |
+| **Flix** (tuned) | 17.6 s | 70.8 s | 173 s |
+
+Three findings worth pulling out:
+
+* **egglog wins the worst-case term outright — untuned.** Its hash-consed
+  datatypes make the huge nested `PrimVal` values O(1) interned keys (the
+  `mcfa_adt.dl` experiment's insight, built into the engine), and its
+  planner runs the appendix's rules as indexed joins with no rewriting. The
+  repo's previous best (tuned Soufflé ≈ tuned Ascent ≈ 1.5 s here) falls to
+  0.63 s.
+* **egglog cannot be tuned out of its Church-term deficit — the rewrites
+  that give 15× (Ascent) and 148× (Soufflé) make egglog *slower*.** Its
+  rounds are synchronized, so intermediate relations add a round of latency
+  per event (+50% iterations), and its e-graph rebuild pass — 631 ms of
+  church(60)'s ~1.2 s, more than all rule matching combined — scales with
+  table count. The engine gives you tuned-join behaviour by default and
+  charges a congruence-maintenance tax you can't opt out of, ~40–50× tuned
+  Ascent on deep terms. There is deliberately no `mcfa_tuned.egg`
+  (`egglog/README.md` documents the negative results).
+* **Flix's engine is orders of magnitude off the pace on every term** —
+  ~13× tuned Ascent on the worst-case term and ~3000× on church(60)
+  (naive), with the tuned rewrite recovering 2–4× on Church terms and
+  ~nothing on the worst case. Rule shape isn't the residue: dropping whole
+  relation families in diagnostics moves ≤25%. The Fixpoint3 solver's
+  per-tuple/per-round constants (boxed values, persistent trees, a RAM
+  interpreter) dominate. The interesting part of Flix is what its
+  *restrictions* teach about schema design, not its throughput.
+
+Scorecard across all nine engines, both regimes: on the **wide, join-heavy
+term** the ranking is egglog < tuned Soufflé ≈ tuned Ascent < faithful
+Ascent < delta worklist < step machine ≪ Flix — the engines optimized for
+bulk joins over interned keys win, hand-written machines lose their edge, and
+the "abstract machine in disguise" is best run as an actual database query.
+On the **deep, flow-propagation term** the ranking inverts almost exactly:
+delta worklist < tuned Ascent < tuned Soufflé ≪ naive Datalogs < egglog ≪
+Flix — everything is per-event/per-round constants, and any engine that
+prices a round above ~microseconds (egglog's rebuild, Flix's interpreter)
+is out of the running no matter how its rules are shaped.
 
 ## Performance: Ascent vs Soufflé, and thread scaling
 

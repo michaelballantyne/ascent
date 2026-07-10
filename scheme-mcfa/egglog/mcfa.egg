@@ -1,0 +1,200 @@
+;; m-CFA for Scheme in egglog — a port of Appendix A of
+;;   Silverman, Sun, Micinski, Gilray.
+;;   "So You Want To Analyze Scheme Programs With Datalog?" (SFPW 2021)
+;; following ../souffle/mcfa.dl rule-for-rule (m = 1, single-id context).
+;;
+;; Differences forced or invited by egglog:
+;;  * Values, continuations, contexts and addresses are egglog datatypes —
+;;    hash-consed terms, like Soufflé ADTs, but egglog rule bodies may match
+;;    them with nested patterns anywhere, so `stored_val`/`stored_kont` are
+;;    queried through their constructor keys directly.
+;;  * egglog has no negation, so the (stratified) `freevar` relation is
+;;    precomputed and supplied as input facts (`mcfa emit-egglog`), exactly as
+;;    the structured Rust variant precomputes it. Everything else is derived
+;;    here.
+;;  * Soufflé's `;` disjunctions become one rule per disjunct (A-IfT,
+;;    peek_ctx), and multi-head rules are one rule with several head actions.
+;;
+;; Run:  egglog mcfa.egg FACTS.egg run.egg
+
+;; ===================== Abstract domains =====================
+(datatype*
+  (Ctxt (Context String))
+  (AddrK (KAddress String Ctxt))
+  (AddrV (VAddress String Ctxt))
+  (Val (VNum i64)
+       (VBool String)
+       (VKont AddrK)
+       (VClosure String Ctxt)
+       (VPrim String Val Val))
+  (Kont (KMt)
+        (KArg String Ctxt Ctxt AddrK)     ; args, ctx, ectx, next_ak
+        (KFn Val i64 Ctxt AddrK)          ; func, pos, ctx, next_ak
+        (KSet AddrV AddrK)                ; loc, next_ak
+        (KIf String String Ctxt AddrK)    ; true_branch, false_branch, ctx, next_ak
+        (KCallcc Ctxt AddrK)              ; ectx, next_ak
+        (KLet AddrV String Ctxt AddrK)    ; av, ebody, ctx, next_ak
+        (KPrim1 String String Ctxt AddrK) ; op, e2, ctx, next_ak
+        (KPrim2 String Val AddrK)))       ; op, v1, next_ak
+
+;; ===================== Input (EDB) relations =====================
+(relation top_exp (String))
+(relation lambda (String String String))          ; Id, Vars, BodyId
+(relation lambda_arg_list (String i64 String))    ; Vars, Pos, X
+(relation prim_call (String String String))       ; Id, Op, Args
+(relation call (String String String))            ; Id, FuncId, Args
+(relation call_arg_list (String i64 String))      ; Args, Pos, ArgId
+(relation var (String String))                    ; Id, Name
+(relation num (String i64))
+(relation boolean (String String))
+(relation if_ (String String String String))      ; Id, Guard, True, False
+(relation setb (String String String))            ; Id, Var, ExprId
+(relation callcc (String String))                 ; Id, ExprId
+(relation let_ (String String String))            ; Id, BindList, Body
+(relation let_list (String String String))        ; BindList, X, EId
+(relation freevar (String String))                ; X, E — precomputed (no negation)
+
+;; ===================== Derived (IDB) relations =====================
+(relation state_e (String Ctxt AddrK))
+(relation state_a (Val AddrK))
+(relation stored_val (AddrV Val))
+(relation stored_kont (AddrK Kont))
+(relation flow_ee (String String))
+(relation flow_ea (String Val))
+(relation flow_aa (Val Val))
+(relation flow_ae (Val String))
+(relation peek_ctx (String Ctxt Ctxt))
+(relation copy_ctx (Ctxt Ctxt String))
+
+;; ===================== Injection =====================
+(rule ((top_exp e))
+      ((state_e e (Context "") (KAddress e (Context "")))
+       (peek_ctx e (Context "") (Context e))
+       (stored_kont (KAddress e (Context "")) (KMt))))
+
+;; ===================== peek_ctx (one rule per introducing form) ==========
+(rule ((state_e e ctx ak) (callcc e elam))    ((peek_ctx e ctx (Context e))))
+(rule ((state_e e ctx ak) (call e ef ea))     ((peek_ctx e ctx (Context e))))
+(rule ((state_e e ctx ak) (let_ e ll body))   ((peek_ctx e ctx (Context e))))
+(rule ((state_e e ctx ak) (lambda e vs body)) ((peek_ctx e ctx (Context e))))
+
+;; ===================== flat-closure copy of free variables ==============
+(rule ((copy_ctx from to e)
+       (freevar fv e)
+       (stored_val (VAddress fv from) v))
+      ((stored_val (VAddress fv to) v)))
+
+;; ===================== E-If =====================
+(rule ((state_e e ctx ak) (if_ e eguard et ef))
+      ((state_e eguard ctx (KAddress eguard ctx))
+       (stored_kont (KAddress eguard ctx) (KIf et ef ctx ak))
+       (flow_ee e eguard)))
+
+;; ===================== E-C/cc =====================
+(rule ((state_e e ctx ak) (callcc e elam) (peek_ctx e ctx ectx))
+      ((state_e elam ctx (KAddress elam ctx))
+       (stored_kont (KAddress elam ctx) (KCallcc ectx ak))
+       (flow_ee e elam)))
+
+;; ===================== E-Set! =====================
+(rule ((state_e e ctx ak) (setb e x esetto))
+      ((state_e esetto ctx (KAddress esetto ctx))
+       (stored_kont (KAddress esetto ctx) (KSet (VAddress x ctx) ak))
+       (flow_ee e esetto)))
+
+;; ===================== E-Call =====================
+(rule ((state_e e ctx ak) (call e efunc eargs) (peek_ctx e ctx ectx))
+      ((state_e efunc ctx (KAddress efunc ctx))
+       (stored_kont (KAddress efunc ctx) (KArg eargs ctx ectx ak))
+       (flow_ee e efunc)))
+
+;; ===================== E-Let =====================
+(rule ((state_e e ctx ak) (let_ e ll ebody) (let_list ll x ebnd) (peek_ctx e ctx ectx))
+      ((state_e ebnd ctx (KAddress ebnd ctx))
+       (stored_kont (KAddress ebnd ctx) (KLet (VAddress x ectx) ebody ectx ak))
+       (copy_ctx ctx ectx e)
+       (flow_ee e ebnd)))
+
+;; ===================== E-Prim =====================
+(rule ((state_e e ctx ak) (prim_call e op pl)
+       (call_arg_list pl 0 earg0) (call_arg_list pl 1 earg1))
+      ((state_e earg0 ctx (KAddress earg0 ctx))
+       (stored_kont (KAddress earg0 ctx) (KPrim1 op earg1 ctx ak))
+       (flow_ee e earg0)))
+
+;; ===================== Atomic evaluation =====================
+(rule ((state_e e ctx ak) (num e n))
+      ((state_a (VNum n) ak) (flow_ea e (VNum n))))
+
+(rule ((state_e e ctx ak) (boolean e b))
+      ((state_a (VBool b) ak) (flow_ea e (VBool b))))
+
+(rule ((state_e e ctx ak) (lambda e vs body))
+      ((state_a (VClosure e ctx) ak) (flow_ea e (VClosure e ctx))))
+
+(rule ((state_e e ctx ak) (var e x) (stored_val (VAddress x ctx) v))
+      ((state_a v ak) (flow_ea e v)))
+
+;; ===================== A-IfT (truthy = anything but #f; one rule per
+;; value shape, as in the Soufflé disjunction) =====================
+(rule ((state_a (VBool "#t") ak) (stored_kont ak (KIf et ef ctxk nak)))
+      ((state_e et ctxk nak) (flow_ae (VBool "#t") et)))
+(rule ((state_a (VClosure ce cc) ak) (stored_kont ak (KIf et ef ctxk nak)))
+      ((state_e et ctxk nak) (flow_ae (VBool "#t") et)))
+(rule ((state_a (VNum n) ak) (stored_kont ak (KIf et ef ctxk nak)))
+      ((state_e et ctxk nak) (flow_ae (VBool "#t") et)))
+(rule ((state_a (VKont k) ak) (stored_kont ak (KIf et ef ctxk nak)))
+      ((state_e et ctxk nak) (flow_ae (VBool "#t") et)))
+
+;; ===================== A-IfF =====================
+(rule ((state_a (VBool "#f") ak) (stored_kont ak (KIf et ef ctxk nak)))
+      ((state_e ef ctxk nak) (flow_ae (VBool "#f") ef)))
+
+;; ===================== A-C/cc (closure operand) =====================
+(rule ((state_a (VClosure elam ctxclo) ak) (stored_kont ak (KCallcc ectx nak))
+       (lambda elam params ebody) (lambda_arg_list params 0 x))
+      ((state_e ebody ectx nak)
+       (stored_val (VAddress x ectx) (VKont ak))
+       (copy_ctx ctxclo ectx elam)
+       (flow_ae (VClosure elam ctxclo) ebody)))
+
+;; ===================== A-C/cc (continuation operand) =====================
+(rule ((state_a (VKont bk) ak) (stored_kont ak (KCallcc ectx nak)))
+      ((state_a (VKont ak) bk) (flow_aa (VKont bk) (VKont ak))))
+
+;; ===================== A-Ar =====================
+(rule ((state_a v ak) (stored_kont ak (KArg eargs ctx ectx nak))
+       (call_arg_list eargs pos earg))
+      ((state_e earg ctx (KAddress earg ctx))
+       (stored_kont (KAddress earg ctx) (KFn v pos ectx nak))
+       (flow_ae v earg)))
+
+;; ===================== A-Call (closure operator) =====================
+(rule ((state_a v ak) (stored_kont ak (KFn (VClosure elam ctxclo) pos ectx nak))
+       (lambda elam params ebody) (lambda_arg_list params pos x))
+      ((state_e ebody ectx nak)
+       (stored_val (VAddress x ectx) v)
+       (copy_ctx ctxclo ectx elam)
+       (flow_ae v ebody)))
+
+;; ===================== A-Call (continuation operator) =====================
+(rule ((state_a v ak) (stored_kont ak (KFn (VKont ck) 0 ectx nak)))
+      ((state_a v ck) (flow_aa v v)))
+
+;; ===================== A-Let =====================
+(rule ((state_a v ak) (stored_kont ak (KLet av ebody ctx nak)))
+      ((state_e ebody ctx nak) (stored_val av v) (flow_ae v ebody)))
+
+;; ===================== A-Prim1 =====================
+(rule ((state_a v ak) (stored_kont ak (KPrim1 op earg1 ctx nak)))
+      ((state_e earg1 ctx (KAddress earg1 ctx))
+       (stored_kont (KAddress earg1 ctx) (KPrim2 op v nak))
+       (flow_ae v earg1)))
+
+;; ===================== A-Prim2 =====================
+(rule ((state_a v2 ak) (stored_kont ak (KPrim2 op v1 nak)))
+      ((state_a (VPrim op v1 v2) nak) (flow_aa v2 (VPrim op v1 v2))))
+
+;; ===================== A-Set! =====================
+(rule ((state_a v ak) (stored_kont ak (KSet loc nak)))
+      ((state_a (VNum -42) nak) (stored_val loc v) (flow_aa v (VNum -42))))

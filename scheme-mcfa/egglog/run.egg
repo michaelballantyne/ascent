@@ -1,0 +1,4 @@
+;; Driver tail: saturate the analysis and print every relation's size.
+;;   egglog mcfa.egg FACTS.egg run.egg
+(run-schedule (saturate (run)))
+(print-size)
