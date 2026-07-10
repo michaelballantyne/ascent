@@ -49,6 +49,7 @@ This crate:
 | `src/aam_delta.rs` | **No Datalog #2:** an event-driven worklist — each derived fact processed exactly once against reverse dependency indices; semi-naive evaluation by hand (`analyze_aam_delta`). |
 | `src/parallel.rs` | The generic analysis via `ascent_run_par!` (`analyze_generic_par`), for thread-scaling measurements. |
 | `src/main.rs` | CLI runner / benchmarks. |
+| `plusplus/` | **Separate crate:** evaluation of the [`plusplus` Ascent fork](https://github.com/michaelballantyne/ascent/tree/plusplus) (Slog-style features) against these implementations. Headline: the fork's explicit `delta` body-atom marker expresses the tuned port's delta-first scheduling as plain rule order — no materialized intermediates — and beats `tuned.rs` on the deep Church terms. Also: an honest negative on the Slog-style ID/`function` features, a chunked-arrival incremental analysis, and three fork bugs with repros. See `plusplus/README.md`. |
 | `souffle/mcfa.dl` | The original Soufflé program, transcribed verbatim from Appendix A (only change: Soufflé 2.4.1 spells the nullary constructor `$MT()`). |
 | `souffle/mcfa_adt.dl` | **Experiment:** a Soufflé version that carries syntax as an `expr` ADT instead of flat relations, to test whether ADTs regress performance. |
 | `souffle/mcfa_tuned.dl` | **Experiment:** the Soufflé program tuned with per-version `.plan` directives and an internally-flattened store (148× on church(80)). |
