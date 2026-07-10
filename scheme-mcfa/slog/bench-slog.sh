@@ -110,9 +110,23 @@ for spec in "${specs[@]}"; do
     for rep in $(seq "$REPS"); do
       rm -rf "$outdir"
       log="$WORK/$name-$var.log"
-      (cd "$SLOG_DIR" && SLOG_NO_MEM_CAP=1 timeout "$TIMEOUT" \
-         racket slog.rkt --no-banner -d "$dbname" --debug-dir "$outdir" "$f") > "$log" 2>&1
-      if [ $? -ne 0 ]; then fail="run FAILED (see $log)"; break; fi
+      attempt=0
+      while :; do
+        attempt=$((attempt + 1))
+        (cd "$SLOG_DIR" && SLOG_NO_MEM_CAP=1 timeout "$TIMEOUT" \
+           racket slog.rkt --no-banner -d "$dbname" --debug-dir "$outdir" "$f") > "$log" 2>&1
+        rc=$?
+        # A daemon/plugin error can print mid-run and leave a truncated but
+        # exit-0 log (a crashed rep's early `(fixpoint ...)` lines summed to
+        # a falsely-low, INCOMPLETE time) -- treat that the same as a
+        # nonzero exit: retry a couple of times before giving up.
+        if [ $rc -ne 0 ] || grep -qE 'Slog execution failed|error "failed to load plugin' "$log"; then
+          if [ "$attempt" -lt 3 ]; then continue; fi
+          fail="run FAILED after $attempt attempts (see $log)"
+        fi
+        break
+      done
+      [ -n "$fail" ] && break
       times+=("$(evalms "$log")")
     done
     if [ -n "$fail" ]; then
