@@ -159,19 +159,93 @@ greedy body scheduling, closed lower-stratum relations read without deltas):
 
 ## Benchmarking
 
-`bench-slog.sh` ties the two systems together: it emits the crate's
-benchmark terms as Slog programs (`mcfa emit-slog`, per-occurrence labels),
-runs each against both `mcfa.slog` and `mcfa-tuned.slog`, **validates every
-output relation's cardinality against the Ascent structured analysis** on
-the same term, diffs tuned against faithful row-for-row, and reports the
-median summed per-stratum fixpoint time (the daemon's `(fixpoint …)` lines
-— pure evaluation, excluding compile/parse/CSV I/O, so it is the number
-comparable to the in-process Ascent timings from `mcfa engines`).
+`bench-slog.sh` ties the two systems together: it emits each benchmark term
+as a tiny **loader program** (`mcfa emit-slog-db`, per-occurrence labels —
+just the syntax types plus a `(top …)` fact), loads it once per term with
+`--out-db`, then runs `mcfa.slog` / `mcfa-tuned.slog` against that saved
+database with `-d`. Because the analysis files' own rule text never changes
+across terms, their compiled plugins are a cache hit after the very first
+time they're ever built — only the term-specific loader recompiles per
+term, and it's small. This **validates every output relation's cardinality
+against the Ascent structured analysis** on the same term, diffs tuned
+against faithful row-for-row, and reports the median summed per-stratum
+fixpoint time (the daemon's `(fixpoint …)` lines — pure evaluation,
+excluding compile/parse/CSV I/O, comparable to the in-process Ascent
+timings from `mcfa engines`).
 
 ```sh
 SLOG_DIR=/path/to/slog ./bench-slog.sh                  # default sweep
 SLOG_DIR=/path/to/slog ./bench-slog.sh "worst 12 3 0"   # one term
 ```
 
-<!-- BENCH-RESULTS -->
+### Results (median of 3 reps, fixpoint-ms; all relation counts validated
+### against Ascent, tuned ≡ faithful row-for-row on every term)
+
+| term | faithful | tuned | tuned speedup |
+|---|---|---|---|
+| feature | 60.5 | 39.6 | 1.5x |
+| worst 8 3 0 | 222.5 | 148.0 | 1.5x |
+| worst 12 3 0 | 522.4 | 439.9 | 1.2x |
+| church 20 | 9,590 | 6,056 | 1.6x |
+
+Tuning is a modest, consistent win (1.2–1.6x) rather than the dramatic
+speedup a single untuned/tuned pair might suggest — see the methodology
+note below on why single-run comparisons on this class of workload are
+unreliable.
+
+**vs. Ascent** (`mcfa engines`, in-process, best-of-N-engines; both sides
+exclude any one-time compile cost):
+
+| term | Slog tuned | Ascent best | ratio |
+|---|---|---|---|
+| worst 8 3 0 | 148ms | 275ms (flat, tuned) | **Slog ~1.9x faster** |
+| worst 12 3 0 | 440ms | 2,242ms (flat, tuned) | **Slog ~5.1x faster** |
+| church 20 | 6,056ms | 3.5ms (hand-written AAM delta worklist) | Ascent ~1,700x faster |
+
+Two very different regimes. `worst N 3 0` is *fact-dense per round* — its
+main SCC needs only ~90 semi-naive rounds to derive ~500K+ facts (roughly
+1,000 facts/round) — and there Slog's parallel, index-planned engine beats
+even Ascent's hand-tuned ports outright, with zero manual join ordering.
+`church N` is the opposite: its abstract-machine trace is a long,
+*sequential* chain (each numeral/fold step depends on the previous one
+fully resolving), so its main SCC needs thousands of rounds averaging
+**under one new fact per round**. Measured directly (a bare 4,000-step
+successor chain, isolated from this analysis entirely): Slog's per-round
+floor is ~50µs/round single-threaded and *increases* with thread count on
+tiny deltas (3x slower at 4 threads than 1, since partitioning/barrier
+overhead has nothing to amortize against); a stratum with 30 dead
+co-resident relations costs ~10x more per round than one without them, even
+though those relations never derive a single fact — the daemon appears to
+pay for every relation's version-rotation and every rule-version's
+scheduling once per round, regardless of whether that round's delta touches
+them. Ascent's generated Rust loop has none of this fixed cost, so it
+absorbs thousands of nearly-empty rounds for microseconds each, while
+Slog's bulk-superstep design — built to amortize over large deltas — pays
+its setup cost thousands of times over. This is a workload-shape
+mismatch, not a defect in the m-CFA encoding: the same rules that make Slog
+competitive-to-better on `worst` make it look bad on `church`.
+
+**Known ceiling:** terms are compiled as literal Slog facts (there is no
+CSV/binary-import bypass in this toolchain — confirmed by reading the
+compiler; `--out-db`/`-d` only saves what a compiled program derived, it
+doesn't accept raw input). Slog's front end does not scale gracefully past
+roughly 1,000–2,000 distinct interned syntax nodes for a recursive
+structured value: `church 40` (1,834 nodes) and `church 80` (6,834 nodes)
+both fail to compile within minutes — one hangs in the Racket-side join
+planner, the other in C++ codegen — regardless of whether the term is
+inlined with the analysis or split into its own loader file. `church 20`
+(534 nodes) and `worst 12 3 0` are the largest terms exercised here.
+
+**Methodology caveats, found the hard way:** this container's timing
+proved noisy enough that single runs disagreed with each other by up to
+5x with no code changes; a stale-cache interaction between the inline and
+staged input methods produced genuine (reproducible, not transient)
+`undefined symbol` plugin-load crashes that an earlier version of this
+script silently mistook for successful-but-fast runs (summing only the
+`(fixpoint …)` lines printed before the crash). `bench-slog.sh` now retries
+a rep on that failure signature rather than accepting a truncated log; the
+table above is from a from-scratch build-cache clear, 3 clean serial reps,
+zero crashes. Treat the ratios above as reliable to about ±20%, not as
+precise multipliers — and treat any *single*-run comparison on this class
+of workload (few-fact-per-round, thousands of rounds) with real suspicion.
 
